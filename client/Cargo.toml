@@ -1,0 +1,65 @@
+# NOTE: Must cross-compile for Windows. The windows crate fails on Linux native builds.
+#
+# Build with MSVC (recommended - no runtime dependencies):
+#   cargo xwin build --target x86_64-pc-windows-msvc --release
+#   Output: target/x86_64-pc-windows-msvc/release/chatti_client.dll
+#
+# Install tools:
+#   cargo install cargo-xwin
+#   rustup target add x86_64-pc-windows-msvc
+
+[package]
+name = "vloxximity-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Nexus addon framework
+nexus = { git = "https://github.com/Zerthox/nexus-rs" }
+
+# Audio I/O
+cpal = "0.15"
+
+# Voice codec - pure Rust implementation (no C dependencies)
+mousiki = "0.2"
+
+# Voice activity detection
+webrtc-vad = "0.4"
+
+# 3D spatial audio - using simple panning for now
+# hrtf = "0.8" # TODO: Add HRTF support later
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time", "macros"] }
+
+# WebSocket client - use rustls for cross-compilation
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+url = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Utilities
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+once_cell = "1"
+bytes = "1"
+
