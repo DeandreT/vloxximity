@@ -154,6 +154,42 @@ fn render_main(ui: &Ui) {
     {
         let vm = state.voice_manager.read();
         render_speaking_indicator(ui, &vm);
+        render_peer_markers(ui, &vm);
+    }
+}
+
+fn render_peer_markers(ui: &Ui, voice_manager: &VoiceManager) {
+    if !voice_manager.settings().show_peer_markers {
+        return;
+    }
+
+    let Some(camera) = voice_manager.last_camera_transform() else {
+        return;
+    };
+    // Vertical FOV in radians, fallback ~70° when the identity JSON hasn't
+    // arrived yet (loading screens, zoning).
+    let fov_v = voice_manager.last_fov().unwrap_or(1.222);
+
+    let peers = voice_manager.get_peers();
+    if peers.is_empty() {
+        return;
+    }
+
+    let display = ui.io().display_size;
+    let draw = ui.get_foreground_draw_list();
+
+    for peer in peers {
+        let Some([sx, sy]) = camera.world_to_screen(&peer.position, fov_v, display) else {
+            continue;
+        };
+        let color = if peer.is_speaking {
+            [0.2, 1.0, 0.2, 1.0]
+        } else {
+            [1.0, 0.85, 0.2, 1.0]
+        };
+        draw.add_circle([sx, sy], 8.0, color).thickness(2.0).build();
+        draw.add_circle([sx, sy], 2.0, color).filled(true).build();
+        draw.add_text([sx + 12.0, sy - 8.0], color, &peer.player_name);
     }
 }
 

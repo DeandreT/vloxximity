@@ -319,8 +319,9 @@ mod tests {
     fn dead_right_max_itd() {
         let mut state = SpatialState::new();
         let listener = listener_at_origin();
-        // Listener's right is -X (GW2 handedness), so source at -X is dead right.
-        let source = Position::new(-10.0, 0.0, 0.0);
+        // DirectX LH: listener facing +Z has right = +X, so a source at +X
+        // world is dead right.
+        let source = Position::new(10.0, 0.0, 0.0);
         let cfg = cfg_full3d();
         let mut out = vec![0.0f32; FRAME_LEN * 2];
 
@@ -424,7 +425,7 @@ mod tests {
         frame1[0] = 1.0;
         let frame2 = vec![0.0f32; FRAME_LEN];
 
-        let source = Position::new(-10.0, 0.0, 0.0); // listener's right
+        let source = Position::new(10.0, 0.0, 0.0); // listener's right (DX LH)
         let mut out = vec![0.0f32; FRAME_LEN * 2];
 
         // Two frames — write_idx wraps many times (1920 / 64 = 30).

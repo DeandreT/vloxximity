@@ -44,6 +44,7 @@ pub struct VoiceSettings {
     pub directional_audio_enabled: bool,
     /// When directional audio is on, selects 3D filter model vs legacy 2D pan.
     pub spatial_3d_enabled: bool,
+    pub show_peer_markers: bool,
     pub server_url: String,
 }
 
@@ -60,6 +61,7 @@ impl Default for VoiceSettings {
             is_deafened: false,
             directional_audio_enabled: true,
             spatial_3d_enabled: true,
+            show_peer_markers: true,
             server_url: DEFAULT_SERVER_URL.to_string(),
         }
     }
@@ -147,6 +149,11 @@ pub struct VoiceManager {
     // Last known listener (avatar) position, cached from MumbleLink for UI display.
     last_listener_position: Option<crate::position::Position>,
 
+    // Last known camera transform + vertical FOV, cached for the world-space
+    // peer marker overlay.
+    last_camera_transform: Option<crate::position::Transform>,
+    last_fov: Option<f32>,
+
     // Shutdown flag
     shutdown: bool,
 }
@@ -178,6 +185,8 @@ impl VoiceManager {
             runtime: None,
             last_position_update: Instant::now(),
             last_listener_position: None,
+            last_camera_transform: None,
+            last_fov: None,
             shutdown: false,
         }
     }
@@ -265,6 +274,11 @@ impl VoiceManager {
             // Cache the camera position so the UI distance readout matches
             // what the audio pipeline hears from (camera, not avatar).
             self.last_listener_position = Some(state.camera_transform.position);
+            self.last_camera_transform = Some(state.camera_transform);
+            self.last_fov = state.identity.as_ref().map(|i| i.fov).filter(|f| *f > 0.0);
+            self.send_incoming_audio_command(IncomingAudioCommand::SetListenerTransform(
+                state.camera_transform,
+            ));
             let room_key = state.room_key.clone();
 
             // Check if room changed
@@ -612,6 +626,16 @@ impl VoiceManager {
     /// Get peer count
     pub fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Get the last known camera transform (position, front, top), if any.
+    pub fn last_camera_transform(&self) -> Option<crate::position::Transform> {
+        self.last_camera_transform
+    }
+
+    /// Get the last known vertical field of view in radians, if any.
+    pub fn last_fov(&self) -> Option<f32> {
+        self.last_fov
     }
 
     /// Get peer info for the UI, including position and distance from the listener.

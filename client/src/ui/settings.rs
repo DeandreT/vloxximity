@@ -267,6 +267,13 @@ impl SettingsWindow {
                         ui.text_disabled("On: ITD + front/back filter. Off: 2D pan.");
                         ui.unindent();
                     }
+
+                    let mut show_markers = new_settings.show_peer_markers;
+                    if ui.checkbox("Show Peer Markers", &mut show_markers) {
+                        new_settings.show_peer_markers = show_markers;
+                        settings_changed = true;
+                    }
+                    ui.text_disabled("Draw world-space icons at peer positions");
                 }
 
                 ui.separator();
@@ -391,6 +398,7 @@ impl SettingsWindow {
                 s.is_deafened = settings.is_deafened;
                 s.directional_audio_enabled = settings.directional_audio_enabled;
                 s.spatial_3d_enabled = settings.spatial_3d_enabled;
+                s.show_peer_markers = settings.show_peer_markers;
             });
         }
 

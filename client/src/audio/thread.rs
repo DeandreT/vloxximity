@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::position::{MumbleLink, Position, Transform};
+use crate::position::{Position, Transform};
 use crate::voice::mixer::AudioMixer;
 
 use super::capture::{AudioCapture, FRAME_SIZE, SAMPLE_RATE};
@@ -38,6 +38,7 @@ pub enum AudioCommand {
 #[derive(Debug, Clone)]
 pub enum IncomingAudioCommand {
     ResetIncoming,
+    SetListenerTransform(Transform),
     SetPlaybackSettings {
         min_distance: f32,
         max_distance: f32,
@@ -368,6 +369,9 @@ impl IncomingPlaybackEngine {
     fn handle_command(&mut self, cmd: IncomingAudioCommand, playback: Option<&AudioPlayback>) {
         match cmd {
             IncomingAudioCommand::ResetIncoming => self.reset(playback),
+            IncomingAudioCommand::SetListenerTransform(transform) => {
+                self.listener_transform = transform;
+            }
             IncomingAudioCommand::SetPlaybackSettings {
                 min_distance,
                 max_distance,
@@ -529,13 +533,8 @@ fn audio_thread_main(
 
     let mut capture: Option<AudioCapture> = None;
     let mut playback: Option<AudioPlayback> = None;
-    let mut mumble_link = MumbleLink::new();
     let mut incoming = IncomingPlaybackEngine::new();
     let mut is_active = false;
-
-    if let Err(e) = mumble_link.init() {
-        log::error!("Failed to initialize audio-thread MumbleLink: {}", e);
-    }
 
     let mut cap = AudioCapture::new();
     if let Err(e) = cap.use_default_device() {
@@ -628,14 +627,6 @@ fn audio_thread_main(
 
         while let Ok(cmd) = incoming_rx.try_recv() {
             incoming.handle_command(cmd, playback.as_ref());
-        }
-
-        if let Some(state) = mumble_link.read() {
-            // Listen from the camera (position, orientation): distance and
-            // panning both reference where the player's POV is, not where the
-            // character is standing. Outgoing broadcasts still use the avatar
-            // position so remote listeners hear us from our character.
-            incoming.listener_transform = state.camera_transform;
         }
 
         if is_active {
