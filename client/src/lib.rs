@@ -86,11 +86,11 @@ fn addon_load() {
 
             // Register keybinds
             let ptt_handler = keybind_handler!(handle_ptt);
-            register_keybind_with_string("VLOXXIMITY_PTT", ptt_handler, "")
+            register_keybind_with_string("Push To Talk", ptt_handler, "")
                 .revert_on_unload();
 
             let toggle_handler = keybind_handler!(handle_toggle);
-            register_keybind_with_string("VLOXXIMITY_TOGGLE", toggle_handler, "")
+            register_keybind_with_string("Settings Window Toggle", toggle_handler, "")
                 .revert_on_unload();
 
             log(LogLevel::Info, "Vloxximity", "Vloxximity loaded successfully");
