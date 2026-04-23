@@ -248,6 +248,29 @@ impl SettingsWindow {
 
                 ui.separator();
 
+                // Spatial audio
+                if ui.collapsing_header("Spatial Audio", TreeNodeFlags::DEFAULT_OPEN) {
+                    let mut directional = new_settings.directional_audio_enabled;
+                    if ui.checkbox("Directional Audio", &mut directional) {
+                        new_settings.directional_audio_enabled = directional;
+                        settings_changed = true;
+                    }
+                    ui.text_disabled("Off: all peers play centered (mono)");
+
+                    if new_settings.directional_audio_enabled {
+                        ui.indent();
+                        let mut spatial_3d = new_settings.spatial_3d_enabled;
+                        if ui.checkbox("3D Spatial Audio", &mut spatial_3d) {
+                            new_settings.spatial_3d_enabled = spatial_3d;
+                            settings_changed = true;
+                        }
+                        ui.text_disabled("On: ITD + front/back filter. Off: 2D pan.");
+                        ui.unindent();
+                    }
+                }
+
+                ui.separator();
+
                 // Mute/Deaf controls
                 if ui.collapsing_header("Controls", TreeNodeFlags::DEFAULT_OPEN) {
                     let mut muted = new_settings.is_muted;
@@ -366,6 +389,8 @@ impl SettingsWindow {
                 s.max_distance = settings.max_distance;
                 s.is_muted = settings.is_muted;
                 s.is_deafened = settings.is_deafened;
+                s.directional_audio_enabled = settings.directional_audio_enabled;
+                s.spatial_3d_enabled = settings.spatial_3d_enabled;
             });
         }
 

@@ -17,7 +17,7 @@ use crate::voice::mixer::AudioMixer;
 use super::capture::{AudioCapture, FRAME_SIZE, SAMPLE_RATE};
 use super::codec::OpusDecoder;
 use super::playback::AudioPlayback;
-use super::spatial::SpatialProcessor;
+use super::spatial::{SpatialConfig, SpatialMode, SpatialState};
 
 /// Commands for the audio thread.
 #[derive(Debug)]
@@ -43,6 +43,8 @@ pub enum IncomingAudioCommand {
         max_distance: f32,
         output_volume: f32,
         is_deafened: bool,
+        directional_audio_enabled: bool,
+        spatial_3d_enabled: bool,
     },
     UpsertPeer {
         peer_id: String,
@@ -216,6 +218,7 @@ struct PlaybackPeer {
     jitter_buffer: JitterBuffer,
     last_audio_time: Instant,
     last_distance_log: Instant,
+    spatial: SpatialState,
 }
 
 impl PlaybackPeer {
@@ -230,6 +233,7 @@ impl PlaybackPeer {
             jitter_buffer: JitterBuffer::new(3, 10),
             last_audio_time: Instant::now(),
             last_distance_log: Instant::now() - Duration::from_secs(10),
+            spatial: SpatialState::new(),
         })
     }
 
@@ -256,23 +260,24 @@ impl PlaybackPeer {
     fn next_spatial_audio(
         &mut self,
         listener: &Transform,
-        processor: &mut SpatialProcessor,
-        min_distance: f32,
-        max_distance: f32,
-    ) -> Option<Vec<f32>> {
+        cfg: &SpatialConfig,
+        stereo_out: &mut [f32],
+    ) -> bool {
         if self.is_muted {
             let _ = self.jitter_buffer.pop();
-            return None;
+            return false;
         }
 
-        let mono = self.jitter_buffer.pop()?;
+        let Some(mono) = self.jitter_buffer.pop() else {
+            return false;
+        };
 
         if self.last_distance_log.elapsed() > Duration::from_secs(2) {
             let distance = listener.position.distance_to(&self.position);
             let (right_c, up_c, front_c) = listener.relative_position(&self.position);
             let azimuth_deg = listener.azimuth_to(&self.position).to_degrees();
             log::info!(
-                "peer '{}' distance={:.1} listener=({:.1},{:.1},{:.1}) front=({:.2},{:.2},{:.2}) top=({:.2},{:.2},{:.2}) source=({:.1},{:.1},{:.1}) local=(right={:.1},up={:.1},front={:.1}) azimuth={:.0}° min={:.0} max={:.0}",
+                "peer '{}' distance={:.1} listener=({:.1},{:.1},{:.1}) front=({:.2},{:.2},{:.2}) top=({:.2},{:.2},{:.2}) source=({:.1},{:.1},{:.1}) local=(right={:.1},up={:.1},front={:.1}) azimuth={:.0}° min={:.0} max={:.0} mode={:?}",
                 self.player_name,
                 distance,
                 listener.position.x, listener.position.y, listener.position.z,
@@ -281,34 +286,26 @@ impl PlaybackPeer {
                 self.position.x, self.position.y, self.position.z,
                 right_c, up_c, front_c,
                 azimuth_deg,
-                min_distance, max_distance,
+                cfg.min_distance, cfg.max_distance, cfg.mode,
             );
             self.last_distance_log = Instant::now();
         }
 
-        let (left, right) = processor.process_with_transform(
-            &mono,
-            listener,
-            &self.position,
-            min_distance,
-            max_distance,
-        );
-
-        let mut stereo = SpatialProcessor::interleave(&left, &right);
-        for sample in &mut stereo {
+        self.spatial
+            .process_frame(&mono, listener, &self.position, cfg, stereo_out);
+        for sample in stereo_out.iter_mut() {
             *sample *= self.volume;
         }
-        Some(stereo)
+        true
     }
 }
 
 struct IncomingPlaybackEngine {
     peers: HashMap<String, PlaybackPeer>,
     listener_transform: Transform,
-    spatial: SpatialProcessor,
+    spatial_cfg: SpatialConfig,
+    peer_scratch: Vec<f32>,
     mixer: AudioMixer,
-    min_distance: f32,
-    max_distance: f32,
     output_volume: f32,
     is_deafened: bool,
     frame_duration: Duration,
@@ -321,16 +318,13 @@ impl IncomingPlaybackEngine {
     fn new() -> Self {
         let now = Instant::now();
         let frame_duration = Duration::from_secs_f32(FRAME_SIZE as f32 / SAMPLE_RATE as f32);
-        let mut spatial = SpatialProcessor::new();
-        let _ = spatial.init();
 
         Self {
             peers: HashMap::new(),
             listener_transform: Transform::default(),
-            spatial,
+            spatial_cfg: SpatialConfig::default(),
+            peer_scratch: vec![0.0; FRAME_SIZE * 2],
             mixer: AudioMixer::new(),
-            min_distance: 100.0,
-            max_distance: 5000.0,
             output_volume: 1.0,
             is_deafened: false,
             frame_duration,
@@ -379,9 +373,16 @@ impl IncomingPlaybackEngine {
                 max_distance,
                 output_volume,
                 is_deafened,
+                directional_audio_enabled,
+                spatial_3d_enabled,
             } => {
-                self.min_distance = min_distance;
-                self.max_distance = max_distance;
+                self.spatial_cfg.min_distance = min_distance;
+                self.spatial_cfg.max_distance = max_distance;
+                self.spatial_cfg.mode = match (directional_audio_enabled, spatial_3d_enabled) {
+                    (false, _) => SpatialMode::Off,
+                    (true, false) => SpatialMode::Pan2D,
+                    (true, true) => SpatialMode::Full3D,
+                };
                 self.output_volume = output_volume;
                 self.mixer.set_master_volume(output_volume);
                 self.set_deafened(playback, is_deafened);
@@ -497,13 +498,12 @@ impl IncomingPlaybackEngine {
             let mut peer_audio = Vec::new();
 
             for peer in self.peers.values_mut() {
-                if let Some(audio) = peer.next_spatial_audio(
+                if peer.next_spatial_audio(
                     &self.listener_transform,
-                    &mut self.spatial,
-                    self.min_distance,
-                    self.max_distance,
+                    &self.spatial_cfg,
+                    &mut self.peer_scratch,
                 ) {
-                    peer_audio.push(audio);
+                    peer_audio.push(self.peer_scratch.clone());
                 }
             }
 

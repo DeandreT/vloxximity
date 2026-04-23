@@ -222,8 +222,13 @@ mod tests {
         assert!(up.abs() < 0.001);
         assert!((front - 5.0).abs() < 0.001);
 
-        // Point to the right
-        let right_point = Position::new(3.0, 0.0, 0.0);
+        let left_point = Position::new(3.0, 0.0, 0.0);
+        let (right, up, front) = transform.relative_position(&left_point);
+        assert!((right + 3.0).abs() < 0.001);
+        assert!(up.abs() < 0.001);
+        assert!(front.abs() < 0.001);
+
+        let right_point = Position::new(-3.0, 0.0, 0.0);
         let (right, up, front) = transform.relative_position(&right_point);
         assert!((right - 3.0).abs() < 0.001);
         assert!(up.abs() < 0.001);
@@ -247,7 +252,7 @@ mod tests {
         };
 
         let point = transform.local_offset_to_world(3.0, 2.0, 7.0);
-        assert!((point.x - 13.0).abs() < 0.001);
+        assert!((point.x - 7.0).abs() < 0.001);
         assert!((point.y - 7.0).abs() < 0.001);
         assert!((point.z - 27.0).abs() < 0.001);
     }

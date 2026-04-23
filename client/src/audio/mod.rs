@@ -8,7 +8,7 @@ pub mod vad;
 pub use capture::{AudioCapture, FRAME_SIZE, SAMPLE_RATE};
 pub use codec::{OpusDecoder, OpusEncoder};
 pub use playback::AudioPlayback;
-pub use spatial::SpatialProcessor;
+pub use spatial::{SpatialConfig, SpatialMode, SpatialState};
 pub use thread::{AudioThread, IncomingAudioCommand};
 pub use vad::VoiceActivityDetector;
 

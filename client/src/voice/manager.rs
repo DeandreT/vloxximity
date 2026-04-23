@@ -39,6 +39,11 @@ pub struct VoiceSettings {
     pub output_volume: f32,
     pub is_muted: bool,
     pub is_deafened: bool,
+    /// Master switch for directional cues. When false, all peers play centered
+    /// (mono → both ears) with distance attenuation only.
+    pub directional_audio_enabled: bool,
+    /// When directional audio is on, selects 3D filter model vs legacy 2D pan.
+    pub spatial_3d_enabled: bool,
     pub server_url: String,
 }
 
@@ -53,6 +58,8 @@ impl Default for VoiceSettings {
             output_volume: 1.0,
             is_muted: false,
             is_deafened: false,
+            directional_audio_enabled: true,
+            spatial_3d_enabled: true,
             server_url: DEFAULT_SERVER_URL.to_string(),
         }
     }
@@ -719,6 +726,8 @@ impl VoiceManager {
             max_distance: self.settings.max_distance,
             output_volume: self.settings.output_volume,
             is_deafened: self.settings.is_deafened,
+            directional_audio_enabled: self.settings.directional_audio_enabled,
+            spatial_3d_enabled: self.settings.spatial_3d_enabled,
         });
     }
 
