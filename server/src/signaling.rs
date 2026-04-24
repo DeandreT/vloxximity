@@ -21,6 +21,11 @@ pub enum ClientMessage {
     JoinRoom {
         room_id: String,
         player_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+    },
+    ValidateApiKey {
+        api_key: String,
     },
     LeaveRoom,
     UpdatePosition {
@@ -52,9 +57,16 @@ pub enum ServerMessage {
     Welcome {
         peer_id: String,
     },
+    AccountValidated {
+        #[serde(default)]
+        account_name: Option<String>,
+    },
     RoomJoined {
         room_id: String,
         peers: Vec<PeerInfo>,
+    },
+    JoinRejected {
+        reason: String,
     },
     PeerJoined {
         peer: PeerInfo,
@@ -103,6 +115,8 @@ enum OutgoingWsMessage {
 pub struct PeerInfo {
     pub peer_id: String,
     pub player_name: String,
+    #[serde(default)]
+    pub account_name: Option<String>,
     pub position: Option<Position>,
     pub front: Option<Position>,
 }
@@ -112,6 +126,7 @@ impl From<crate::rooms::PeerInfo> for PeerInfo {
         Self {
             peer_id: p.peer_id,
             player_name: p.player_name,
+            account_name: p.account_name,
             position: p.position,
             front: p.front,
         }
@@ -191,7 +206,6 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(text) => {
-                tracing::info!("Incoming WS from {}: {}", peer_id_in, text);
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client_msg) => {
                         handle_client_message(&peer_id_in, client_msg, &state_in, &direct_tx_in).await;
@@ -218,7 +232,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Convert room event to server message, filtering by peer
 fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<OutgoingWsMessage> {
     match event {
-        RoomEvent::PeerJoined { peer_id, player_name } => {
+        RoomEvent::PeerJoined { peer_id, player_name, account_name } => {
             if peer_id == self_peer_id {
                 return None;
             }
@@ -226,6 +240,7 @@ fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<Outgoin
                 peer: PeerInfo {
                     peer_id,
                     player_name,
+                    account_name,
                     position: None,
                     front: None,
                 },
@@ -291,9 +306,44 @@ async fn handle_client_message(
     direct_tx: &mpsc::UnboundedSender<ServerMessage>,
 ) {
     match msg {
-        ClientMessage::JoinRoom { room_id, player_name } => {
-            tracing::info!("Received JoinRoom from {} -> room={} player_name={}", peer_id, room_id, player_name);
-            if let Some(peers) = state.rooms.join_room(peer_id, &room_id, &player_name) {
+        ClientMessage::JoinRoom { room_id, player_name, api_key } => {
+            tracing::info!(
+                "Received JoinRoom from {} -> room={} player_name={} api_key={}",
+                peer_id, room_id, player_name, if api_key.is_some() { "yes" } else { "no" }
+            );
+            let account_name = match api_key.as_deref() {
+                Some(key) if !key.trim().is_empty() => {
+                    crate::gw2::validate_api_key(&state.http, &state.gw2_cache, key.trim()).await
+                }
+                _ => None,
+            };
+
+            // Always tell the client the validation outcome, so its UI can
+            // leave the "Validating..." state deterministically even when
+            // they didn't provide a key (in which case account_name is None).
+            let _ = direct_tx.send(ServerMessage::AccountValidated {
+                account_name: account_name.clone(),
+            });
+
+            let Some(account_name) = account_name else {
+                let reason = if api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+                    "GW2 API key rejected — check the key and the 'account' permission"
+                } else {
+                    "GW2 API key required to join rooms (set one in Vloxximity settings)"
+                };
+                tracing::info!(
+                    "Rejecting JoinRoom from {} (room={}): {}",
+                    peer_id, room_id, reason
+                );
+                let _ = direct_tx.send(ServerMessage::JoinRejected {
+                    reason: reason.to_string(),
+                });
+                return;
+            };
+
+            if let Some(peers) =
+                state.rooms.join_room(peer_id, &room_id, &player_name, Some(account_name))
+            {
                 let response = ServerMessage::RoomJoined {
                     room_id: room_id.clone(),
                     peers: peers.into_iter().map(Into::into).collect(),
@@ -303,6 +353,19 @@ async fn handle_client_message(
             } else {
                 tracing::warn!("join_room returned None for peer {}", peer_id);
             }
+        }
+
+        ClientMessage::ValidateApiKey { api_key } => {
+            let trimmed = api_key.trim();
+            let account_name = if trimmed.is_empty() {
+                None
+            } else {
+                crate::gw2::validate_api_key(&state.http, &state.gw2_cache, trimmed).await
+            };
+            state
+                .rooms
+                .set_account_name(peer_id, account_name.clone());
+            let _ = direct_tx.send(ServerMessage::AccountValidated { account_name });
         }
 
         ClientMessage::LeaveRoom => {

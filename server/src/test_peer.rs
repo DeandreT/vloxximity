@@ -293,7 +293,7 @@ async fn run_peer(
             // Stamp position before joining so it's on record the moment the
             // room broadcasts PeerJoined.
             rooms.update_position(&peer_id, pos, front);
-            if rooms.join_room(&peer_id, &room_id, &spec.name).is_none() {
+            if rooms.join_room(&peer_id, &room_id, &spec.name, None).is_none() {
                 tracing::warn!("Test peer failed to join room {}", room_id);
                 rooms.unregister_peer(&peer_id);
                 return;

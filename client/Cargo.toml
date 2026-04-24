@@ -19,7 +19,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Nexus addon framework
-nexus = { git = "https://github.com/Zerthox/nexus-rs" }
+nexus = { git = "https://github.com/Zerthox/nexus-rs", features = ["rtapi"] }
 
 # Audio I/O
 cpal = "0.15"

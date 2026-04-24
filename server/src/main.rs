@@ -2,6 +2,7 @@
 //!
 //! Handles room management, position tracking, and WebRTC signaling for Vloxximity voice chat.
 
+mod gw2;
 mod rooms;
 mod signaling;
 mod test_peer;
@@ -50,6 +51,8 @@ impl Default for ServerConfig {
 pub struct AppState {
     pub rooms: Arc<RoomManager>,
     pub config: Arc<ServerConfig>,
+    pub http: reqwest::Client,
+    pub gw2_cache: gw2::Gw2Cache,
 }
 
 #[tokio::main]
@@ -70,9 +73,15 @@ async fn main() {
     // Create application state
     let mut config = ServerConfig::default();
     config.test_peer_mode = test_peer_mode;
+    let http = reqwest::Client::builder()
+        .user_agent("vloxximity-server/0.1")
+        .build()
+        .expect("reqwest client build");
     let state = AppState {
         rooms: Arc::new(RoomManager::new()),
         config: Arc::new(config),
+        http,
+        gw2_cache: gw2::new_cache(),
     };
 
     if let Some(mode) = state.config.test_peer_mode {

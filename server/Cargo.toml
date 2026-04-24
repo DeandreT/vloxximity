@@ -37,7 +37,11 @@ futures = "0.3"
 # TURN credential generation
 hmac = "0.12"
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
 
 # Audio codec for server-side fake player
 mousiki = "0.2"
+
+# GW2 REST API client (account-name validation)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -20,6 +20,7 @@ pub struct Position {
 pub struct Peer {
     pub id: String,
     pub player_name: String,
+    pub account_name: Option<String>,
     pub room_id: Option<String>,
     pub position: Position,
     pub front: Position,
@@ -39,6 +40,7 @@ impl Peer {
         Self {
             id: Uuid::new_v4().to_string(),
             player_name: String::new(),
+            account_name: None,
             room_id: None,
             position: Position::default(),
             front: Position::new(0.0, 0.0, 1.0),
@@ -60,6 +62,7 @@ pub enum RoomEvent {
     PeerJoined {
         peer_id: String,
         player_name: String,
+        account_name: Option<String>,
     },
     PeerLeft {
         peer_id: String,
@@ -103,6 +106,7 @@ pub struct Room {
 pub struct PeerInfo {
     pub peer_id: String,
     pub player_name: String,
+    pub account_name: Option<String>,
     pub position: Option<Position>,
     pub front: Option<Position>,
 }
@@ -120,6 +124,7 @@ impl Room {
             PeerInfo {
                 peer_id: peer.id.clone(),
                 player_name: peer.player_name.clone(),
+                account_name: peer.account_name.clone(),
                 position: Some(peer.position),
                 front: Some(peer.front),
             },
@@ -180,10 +185,17 @@ impl RoomManager {
     }
 
     /// Join a room
-    pub fn join_room(&self, peer_id: &str, room_id: &str, player_name: &str) -> Option<Vec<PeerInfo>> {
+    pub fn join_room(
+        &self,
+        peer_id: &str,
+        room_id: &str,
+        player_name: &str,
+        account_name: Option<String>,
+    ) -> Option<Vec<PeerInfo>> {
         // Update peer info
         let mut peer = self.peers.get_mut(peer_id)?;
         peer.player_name = player_name.to_string();
+        peer.account_name = account_name.clone();
 
         // Leave current room if any
         if let Some(old_room_id) = peer.room_id.take() {
@@ -215,6 +227,7 @@ impl RoomManager {
         let event = RoomEvent::PeerJoined {
             peer_id: peer_id.to_string(),
             player_name: player_name.to_string(),
+            account_name,
         };
 
         for other_peer in self.peers.iter() {
@@ -266,6 +279,19 @@ impl RoomManager {
         }
 
         tracing::info!("Peer {} left room {}", peer_id, room_id);
+    }
+
+    pub fn set_account_name(&self, peer_id: &str, account_name: Option<String>) {
+        if let Some(mut peer) = self.peers.get_mut(peer_id) {
+            peer.account_name = account_name.clone();
+            if let Some(ref room_id) = peer.room_id {
+                if let Some(room) = self.rooms.get(room_id) {
+                    if let Some(mut info) = room.peers.get_mut(peer_id) {
+                        info.account_name = account_name;
+                    }
+                }
+            }
+        }
     }
 
     /// Update peer position

@@ -1,7 +1,9 @@
 //! Central voice coordination and peer lifecycle management.
 
 use anyhow::Result;
-use std::collections::HashMap;
+use parking_lot::RwLock as PlRwLock;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -13,9 +15,27 @@ use crate::network::signaling::{ConnectionState, PeerInfo, ServerMessage, Signal
 use crate::position::MumbleLink;
 
 use super::peer::VoicePeer;
+use super::persist;
+
+/// Result of a local GW2 API key validation. Lives in a shared slot on
+/// `VoiceManager` so a background tokio task can write the result and the
+/// UI can read it on the next frame.
+#[derive(Debug, Clone)]
+pub enum ApiKeyStatus {
+    /// No key entered, or the current key hasn't been validated yet.
+    Unknown,
+    /// A validation request is in flight.
+    Validating,
+    /// GW2 returned an account handle for this key. `checked_at` is roughly
+    /// when validation completed (used to suppress stale UI messages).
+    Valid { account_name: String },
+    /// GW2 rejected the key or the request failed. `message` is a short,
+    /// user-visible reason.
+    Invalid { message: String },
+}
 
 /// Voice activation mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoiceMode {
     /// Push-to-talk
     PushToTalk,
@@ -28,8 +48,10 @@ pub enum VoiceMode {
 /// Default signaling server URL
 pub const DEFAULT_SERVER_URL: &str = "ws://localhost:8080/ws";
 
-/// Voice manager settings
-#[derive(Debug, Clone)]
+/// Voice manager settings. `#[serde(default)]` on the struct keeps older
+/// on-disk configs loadable as we add new fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VoiceSettings {
     pub mode: VoiceMode,
     pub ptt_key: u32,
@@ -37,7 +59,10 @@ pub struct VoiceSettings {
     pub max_distance: f32,
     pub input_volume: f32,
     pub output_volume: f32,
+    /// Session-only
     pub is_muted: bool,
+    /// Session-only
+    #[serde(skip)]
     pub is_deafened: bool,
     /// Master switch for directional cues. When false, all peers play centered
     /// (mono → both ears) with distance attenuation only.
@@ -46,6 +71,10 @@ pub struct VoiceSettings {
     pub spatial_3d_enabled: bool,
     pub show_peer_markers: bool,
     pub server_url: String,
+    /// Sent to the signaling server so it can validate
+    /// the caller's account name against the GW2 REST API and broadcast the
+    /// verified handle to the room. Only the `account` permission is needed.
+    pub gw2_api_key: String,
 }
 
 impl Default for VoiceSettings {
@@ -61,8 +90,9 @@ impl Default for VoiceSettings {
             is_deafened: false,
             directional_audio_enabled: true,
             spatial_3d_enabled: true,
-            show_peer_markers: true,
+            show_peer_markers: false,
             server_url: DEFAULT_SERVER_URL.to_string(),
+            gw2_api_key: String::new(),
         }
     }
 }
@@ -81,6 +111,8 @@ pub enum VoiceState {
 pub struct NearbyPeer {
     pub peer_id: String,
     pub player_name: String,
+    /// Server-validated GW2 account handle, when known.
+    pub account_name: Option<String>,
     pub is_speaking: bool,
     pub is_muted: bool,
     pub position: crate::position::Position,
@@ -93,7 +125,12 @@ pub struct NearbyPeer {
 pub enum NetworkCommand {
     Connect,
     Disconnect,
-    JoinRoom { room_id: String, player_name: String },
+    JoinRoom {
+        room_id: String,
+        player_name: String,
+        api_key: Option<String>,
+    },
+    ValidateApiKey { api_key: String },
     LeaveRoom,
     UpdatePosition { position: crate::position::Position, front: crate::position::Position },
     SendAudio { data: Vec<u8> },
@@ -104,8 +141,10 @@ pub enum NetworkCommand {
 pub enum NetworkEvent {
     Connected { peer_id: String },
     Disconnected,
+    AccountValidated { account_name: Option<String> },
     RoomJoined { room_id: String, peers: Vec<PeerInfo> },
-    PeerJoined { peer_id: String, player_name: String },
+    JoinRejected { reason: String },
+    PeerJoined { peer_id: String, player_name: String, account_name: Option<String> },
     PeerLeft { peer_id: String },
     PeerPosition { peer_id: String, position: crate::position::Position, front: crate::position::Position },
     AudioReceived { peer_id: String, data: Vec<u8> },
@@ -154,6 +193,28 @@ pub struct VoiceManager {
     last_camera_transform: Option<crate::position::Transform>,
     last_fov: Option<f32>,
 
+    // Our own GW2 account handle, read from RTAPI when available. Shown in
+    // the settings UI so the user can sanity-check the API key they pasted.
+    own_account_name: Option<String>,
+
+    // Persisted account-keyed mutes. Mirrors `<addon_dir>/mutes.json`.
+    muted_accounts: HashSet<String>,
+
+    // Result of the most recent server-side validation of the saved API
+    // key. Populated when the server responds to our JoinRoom with an
+    // AccountValidated message.
+    api_key_status: Arc<PlRwLock<ApiKeyStatus>>,
+
+    // Which API key the current `api_key_status` actually applies to. The
+    // UI uses this to invalidate stale "Valid/Invalid" indicators the
+    // moment the user starts editing a new key.
+    api_key_status_for: Arc<PlRwLock<Option<String>>>,
+
+    // Reason the last JoinRoom was rejected, if any. Cleared on successful
+    // join. Surfaced in the settings UI so the user knows why they're not
+    // hearing anyone.
+    last_join_rejection: Option<String>,
+
     // Shutdown flag
     shutdown: bool,
 }
@@ -168,9 +229,21 @@ unsafe impl Send for VoiceManager {}
 
 impl VoiceManager {
     pub fn new(server_url: &str) -> Self {
+        Self::with_persistence(server_url, VoiceSettings::default(), HashSet::new())
+    }
+
+    /// Construct a `VoiceManager` seeded from disk. Call sites load the
+    /// settings and mutes on addon startup and hand them in here; the
+    /// manager uses the provided `settings.server_url` as its connection
+    /// target.
+    pub fn with_persistence(
+        server_url: &str,
+        settings: VoiceSettings,
+        muted_accounts: HashSet<String>,
+    ) -> Self {
         Self {
             state: VoiceState::Disconnected,
-            settings: VoiceSettings::default(),
+            settings,
             server_url: server_url.to_string(),
             our_peer_id: None,
             mumble_link: MumbleLink::new(),
@@ -187,6 +260,11 @@ impl VoiceManager {
             last_listener_position: None,
             last_camera_transform: None,
             last_fov: None,
+            own_account_name: None,
+            muted_accounts,
+            api_key_status: Arc::new(PlRwLock::new(ApiKeyStatus::Unknown)),
+            api_key_status_for: Arc::new(PlRwLock::new(None)),
+            last_join_rejection: None,
             shutdown: false,
         }
     }
@@ -197,6 +275,7 @@ impl VoiceManager {
         self.shutdown = false;
         // Initialize MumbleLink
         self.mumble_link.init()?;
+        self.refresh_own_account_name();
 
         // Spawn audio thread
         let audio_thread = AudioThread::spawn()?;
@@ -341,7 +420,7 @@ impl VoiceManager {
             let collected: Vec<NetworkEvent> = rx.try_iter().collect();
             for ev in collected.iter() {
                 match ev {
-                    NetworkEvent::PeerJoined { peer_id, player_name } => log::info!("  event: PeerJoined {} ({})", player_name, peer_id),
+                    NetworkEvent::PeerJoined { peer_id, player_name, account_name } => log::info!("  event: PeerJoined {} ({}) account={:?}", player_name, peer_id, account_name),
                     NetworkEvent::PeerPosition { peer_id, .. } => log::info!("  event: PeerPosition ({})", peer_id),
                     NetworkEvent::AudioReceived { peer_id, .. } => log::info!("  event: AudioReceived ({})", peer_id),
                     NetworkEvent::RoomJoined { room_id, peers } => log::info!("  event: RoomJoined {} ({} peers)", room_id, peers.len()),
@@ -349,6 +428,8 @@ impl VoiceManager {
                     NetworkEvent::Disconnected => log::info!("  event: Disconnected"),
                     NetworkEvent::PeerLeft { peer_id } => log::info!("  event: PeerLeft ({})", peer_id),
                     NetworkEvent::Error { message } => log::info!("  event: Error: {}", message),
+                    NetworkEvent::AccountValidated { account_name } => log::info!("  event: AccountValidated account={:?}", account_name),
+                    NetworkEvent::JoinRejected { reason } => log::info!("  event: JoinRejected: {}", reason),
                 }
             }
             collected
@@ -374,12 +455,24 @@ impl VoiceManager {
                             .and_then(|s| s.identity.as_ref().map(|i| i.name.clone()))
                             .filter(|n| !n.trim().is_empty())
                             .unwrap_or_else(|| "Unknown".to_string());
-                        log::info!("Re-joining room {} after reconnect", room_id);
-                        if let Some(tx) = &self.network_cmd_tx {
-                            let _ = tx.send(NetworkCommand::JoinRoom {
-                                room_id,
-                                player_name,
-                            });
+                        let api_key = self.api_key_to_send();
+                        if api_key.is_none() {
+                            let reason = "GW2 API key required to join rooms (set one in Vloxximity settings)";
+                            log::warn!("Skipping reconnect JoinRoom for {}: {}", room_id, reason);
+                            self.current_room = None;
+                            self.last_join_rejection = Some(reason.to_string());
+                        } else {
+                            log::info!("Re-joining room {} after reconnect", room_id);
+                            if let Some(key) = api_key.as_deref() {
+                                self.mark_api_key_validating(key);
+                            }
+                            if let Some(tx) = &self.network_cmd_tx {
+                                let _ = tx.send(NetworkCommand::JoinRoom {
+                                    room_id,
+                                    player_name,
+                                    api_key,
+                                });
+                            }
                         }
                     }
                 }
@@ -394,12 +487,14 @@ impl VoiceManager {
                     log::info!("Joined room {} with {} peers", room_id, peers.len());
                     self.current_room = Some(room_id);
                     self.state = VoiceState::InRoom;
+                    self.last_join_rejection = None;
 
                     self.send_incoming_audio_command(IncomingAudioCommand::ResetIncoming);
 
                     // Add existing peers
                     for peer in peers {
-                        if let Err(e) = self.add_peer(&peer.peer_id, &peer.player_name) {
+                        let account = peer.account_name.as_deref();
+                        if let Err(e) = self.add_peer(&peer.peer_id, &peer.player_name, account) {
                             log::error!("Failed to add peer {}: {}", peer.peer_id, e);
                         }
                         // Update position if available
@@ -408,9 +503,9 @@ impl VoiceManager {
                         }
                     }
                 }
-                NetworkEvent::PeerJoined { peer_id, player_name } => {
-                    log::info!("Peer joined: {} ({})", player_name, peer_id);
-                    if let Err(e) = self.add_peer(&peer_id, &player_name) {
+                NetworkEvent::PeerJoined { peer_id, player_name, account_name } => {
+                    log::info!("Peer joined: {} ({}) account={:?}", player_name, peer_id, account_name);
+                    if let Err(e) = self.add_peer(&peer_id, &player_name, account_name.as_deref()) {
                         log::error!("Failed to add peer {}: {}", peer_id, e);
                     }
                 }
@@ -429,6 +524,21 @@ impl VoiceManager {
                 NetworkEvent::Error { message } => {
                     log::error!("Network error: {}", message);
                 }
+                NetworkEvent::AccountValidated { account_name } => {
+                    self.apply_api_key_validation_result(account_name);
+                }
+                NetworkEvent::JoinRejected { reason } => {
+                    log::warn!("Server rejected JoinRoom: {}", reason);
+                    // Optimistically we'd set `current_room` to the zone
+                    // hash as soon as MumbleLink reported it. Clear it so
+                    // the next MumbleLink tick will retry the join (e.g.
+                    // after the user adds a valid API key).
+                    self.current_room = None;
+                    self.state = VoiceState::Connected;
+                    self.peers.clear();
+                    self.send_incoming_audio_command(IncomingAudioCommand::ResetIncoming);
+                    self.last_join_rejection = Some(reason);
+                }
             }
         }
         Ok(())
@@ -438,15 +548,147 @@ impl VoiceManager {
     fn join_room(&mut self, room_id: &str, player_name: &str) -> Result<()> {
         log::info!("Joining room: {}", room_id);
 
+        let api_key = self.api_key_to_send();
+        if api_key.is_none() {
+            // Mirror the server's refusal locally so the UI can show the
+            // same guidance without a round-trip. We still record the
+            // `room_id` in `current_room` so the MumbleLink-driven tick
+            // doesn't retry the join every frame; `revalidate_saved_api_key`
+            // clears it when the user adds a key.
+            let reason = "GW2 API key required to join rooms (set one in Vloxximity settings)";
+            log::warn!("Skipping JoinRoom for room {}: {}", room_id, reason);
+            self.last_join_rejection = Some(reason.to_string());
+            self.current_room = Some(room_id.to_string());
+            return Ok(());
+        }
+        if let Some(key) = api_key.as_deref() {
+            self.mark_api_key_validating(key);
+        }
         if let Some(tx) = &self.network_cmd_tx {
             tx.send(NetworkCommand::JoinRoom {
                 room_id: room_id.to_string(),
                 player_name: player_name.to_string(),
+                api_key,
             })?;
         }
 
         self.current_room = Some(room_id.to_string());
         Ok(())
+    }
+
+    /// Return the current API key to send on JoinRoom, if the user has
+    /// configured one.
+    fn api_key_to_send(&self) -> Option<String> {
+        let key = self.settings.gw2_api_key.trim();
+        if key.is_empty() {
+            None
+        } else {
+            Some(key.to_string())
+        }
+    }
+
+    /// Read the local GW2 account handle from Nexus RTAPI if present.
+    /// Called once on `init` and on demand from the settings UI.
+    pub fn refresh_own_account_name(&mut self) {
+        self.own_account_name = nexus::rtapi::RealTimeApi::get()
+            .and_then(|api| api.read_player())
+            .map(|player| player.account_name)
+            .filter(|name| !name.is_empty());
+        if let Some(name) = &self.own_account_name {
+            log::info!("RTAPI account name: {}", name);
+        } else {
+            log::info!("RTAPI not active — no local account name available");
+        }
+    }
+
+    /// Local GW2 account handle if we read it from RTAPI.
+    pub fn own_account_name(&self) -> Option<&str> {
+        self.own_account_name.as_deref()
+    }
+
+    /// Reason the server last rejected a JoinRoom, if still relevant.
+    pub fn last_join_rejection(&self) -> Option<&str> {
+        self.last_join_rejection.as_deref()
+    }
+
+    /// Current client-side API key validation status. The returned value is
+    /// a snapshot — the underlying state may change on the next frame.
+    pub fn api_key_status(&self) -> ApiKeyStatus {
+        self.api_key_status.read().clone()
+    }
+
+    /// Returns `true` if the last recorded validation result matches the
+    /// current saved API key. Used by the UI to avoid showing a stale
+    /// "Valid" badge after the user edits the key.
+    pub fn api_key_status_matches_current(&self) -> bool {
+        match &*self.api_key_status_for.read() {
+            Some(key) => key == &self.settings.gw2_api_key,
+            None => false,
+        }
+    }
+
+    /// Mark the currently-saved API key as "in flight" for validation and
+    /// record which key the status applies to. Called right before we send
+    /// a JoinRoom that includes the key.
+    fn mark_api_key_validating(&self, key: &str) {
+        *self.api_key_status.write() = ApiKeyStatus::Validating;
+        *self.api_key_status_for.write() = Some(key.to_string());
+    }
+
+    /// Ask the server to re-validate the saved API key immediately. Used
+    /// when the user edits the key in settings — avoids waiting for the
+    /// next room rejoin. Safe to call without an active room.
+    pub fn revalidate_saved_api_key(&mut self) {
+        let key = self.settings.gw2_api_key.trim().to_string();
+
+        // Invalidate any "already joined" / "locally refused" state tied to
+        // the previous key, so the next MumbleLink tick is free to retry
+        // the join with the new key.
+        if self.state != VoiceState::InRoom {
+            self.current_room = None;
+        }
+        self.last_join_rejection = None;
+
+        if key.is_empty() {
+            // Empty key is a terminal state, not a pending validation.
+            *self.api_key_status.write() = ApiKeyStatus::Unknown;
+            *self.api_key_status_for.write() = Some(String::new());
+            return;
+        }
+        self.mark_api_key_validating(&key);
+        if let Some(tx) = &self.network_cmd_tx {
+            if let Err(e) = tx.send(NetworkCommand::ValidateApiKey {
+                api_key: key,
+            }) {
+                log::warn!("Failed to queue ValidateApiKey command: {}", e);
+                *self.api_key_status.write() = ApiKeyStatus::Invalid {
+                    message: "Not connected to signaling server".to_string(),
+                };
+            }
+        } else {
+            *self.api_key_status.write() = ApiKeyStatus::Invalid {
+                message: "Not connected to signaling server".to_string(),
+            };
+        }
+    }
+
+    /// Update the API key status from a server-reported result. Dropped
+    /// silently if the user has since moved on to a different key
+    fn apply_api_key_validation_result(&self, account_name: Option<String>) {
+        let current = self.settings.gw2_api_key.trim().to_string();
+        let recorded = self.api_key_status_for.read().clone();
+        if recorded.as_deref() != Some(current.as_str()) {
+            return;
+        }
+        *self.api_key_status.write() = match account_name {
+            Some(name) if !name.is_empty() => ApiKeyStatus::Valid { account_name: name },
+            Some(_) => ApiKeyStatus::Invalid {
+                message: "GW2 returned an empty account name".to_string(),
+            },
+            None => ApiKeyStatus::Invalid {
+                message: "Server rejected key or GW2 API unreachable".to_string(),
+            },
+        };
     }
 
     /// Leave current room
@@ -533,9 +775,16 @@ impl VoiceManager {
     }
 
     /// Add a peer (called when a new player joins the room)
-    pub fn add_peer(&mut self, peer_id: &str, player_name: &str) -> Result<()> {
-        // Debug: show current our_peer_id
-        log::info!("add_peer called for {} (name={}), our_peer_id={:?}", peer_id, player_name, self.our_peer_id);
+    pub fn add_peer(
+        &mut self,
+        peer_id: &str,
+        player_name: &str,
+        account_name: Option<&str>,
+    ) -> Result<()> {
+        log::info!(
+            "add_peer called for {} (name={}, account={:?}), our_peer_id={:?}",
+            peer_id, player_name, account_name, self.our_peer_id
+        );
 
         // Don't add ourselves
         if Some(peer_id.to_string()) == self.our_peer_id {
@@ -545,14 +794,36 @@ impl VoiceManager {
 
         log::info!("Adding peer: {} ({})", player_name, peer_id);
 
-        let peer = VoicePeer::new(peer_id.to_string(), player_name.to_string())?;
+        // Apply a persistent mute if this account is on the muted list.
+        let should_mute = account_name
+            .map(|name| self.muted_accounts.contains(name))
+            .unwrap_or(false);
+
+        let mut peer = VoicePeer::new(
+            peer_id.to_string(),
+            player_name.to_string(),
+            account_name.map(|s| s.to_string()),
+        )?;
+        if should_mute {
+            peer.is_muted = true;
+        }
         self.peers.insert(peer_id.to_string(), peer);
         self.send_incoming_audio_command(IncomingAudioCommand::UpsertPeer {
             peer_id: peer_id.to_string(),
             player_name: player_name.to_string(),
         });
+        if should_mute {
+            self.send_incoming_audio_command(IncomingAudioCommand::SetPeerMuted {
+                peer_id: peer_id.to_string(),
+                muted: true,
+            });
+            log::info!(
+                "Auto-muted peer {} ({}): account on persistent mute list",
+                peer_id,
+                account_name.unwrap_or("?"),
+            );
+        }
 
-        // Log peers after insertion
         let ids: Vec<String> = self.peers.keys().cloned().collect();
         log::info!("Peer added. now {} peers: [{}]", self.peers.len(), ids.join(", "));
 
@@ -646,6 +917,7 @@ impl VoiceManager {
             .map(|p| NearbyPeer {
                 peer_id: p.peer_id.clone(),
                 player_name: p.player_name.clone(),
+                account_name: p.account_name.clone(),
                 is_speaking: p.is_speaking(),
                 is_muted: p.is_muted,
                 position: p.position,
@@ -676,17 +948,45 @@ impl VoiceManager {
         }
     }
 
-    /// Mute a specific peer
+    /// Mute a specific peer. If the peer has a server-validated account
+    /// handle, the mute is persisted to `mutes.json` and re-applied when
+    /// the peer reconnects in a future session. Peers without an account
+    /// (no API key / validation failed) can still be muted but only for
+    /// the current session.
     pub fn mute_peer(&mut self, peer_id: &str, muted: bool) {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
-            peer.set_muted(muted);
-            self.send_incoming_audio_command(IncomingAudioCommand::SetPeerMuted {
-                peer_id: peer_id.to_string(),
-                muted,
-            });
-            log::info!("Set mute={} for peer {}", muted, peer_id);
-        } else {
+        let Some(peer) = self.peers.get_mut(peer_id) else {
             log::warn!("mute_peer: peer not found: {}", peer_id);
+            return;
+        };
+        peer.set_muted(muted);
+        let account = peer.account_name.clone();
+        self.send_incoming_audio_command(IncomingAudioCommand::SetPeerMuted {
+            peer_id: peer_id.to_string(),
+            muted,
+        });
+        log::info!("Set mute={} for peer {}", muted, peer_id);
+
+        match account {
+            Some(name) => {
+                let changed = if muted {
+                    self.muted_accounts.insert(name.clone())
+                } else {
+                    self.muted_accounts.remove(&name)
+                };
+                if changed {
+                    persist::save_muted_accounts(&self.muted_accounts);
+                    log::info!(
+                        "Persisted mute set update: {} -> muted={}",
+                        name, muted
+                    );
+                }
+            }
+            None => {
+                log::debug!(
+                    "Peer {} has no account handle; mute is session-only",
+                    peer_id
+                );
+            }
         }
     }
 
@@ -697,19 +997,17 @@ impl VoiceManager {
 
     /// Toggle mute state for a peer and return the new state if present
     pub fn toggle_mute_peer(&mut self, peer_id: &str) -> Option<bool> {
-        if let Some(peer) = self.peers.get_mut(peer_id) {
-            let new_state = !peer.is_muted;
-            peer.set_muted(new_state);
-            self.send_incoming_audio_command(IncomingAudioCommand::SetPeerMuted {
-                peer_id: peer_id.to_string(),
-                muted: new_state,
-            });
-            log::info!("Toggled mute -> {} for peer {}", new_state, peer_id);
-            Some(new_state)
-        } else {
-            log::warn!("toggle_mute_peer: peer not found: {}", peer_id);
-            None
-        }
+        let new_state = {
+            let peer = self.peers.get(peer_id)?;
+            !peer.is_muted
+        };
+        self.mute_peer(peer_id, new_state);
+        Some(new_state)
+    }
+
+    /// Snapshot of currently persisted muted account handles.
+    pub fn muted_accounts(&self) -> &HashSet<String> {
+        &self.muted_accounts
     }
 
     /// Set peer volume
@@ -872,9 +1170,18 @@ async fn network_task(
                         let _ = event_tx.send(NetworkEvent::Disconnected);
                         break;
                     }
-                    NetworkCommand::JoinRoom { room_id, player_name } => {
-                        if let Err(e) = signaling_client.join_room(&room_id, &player_name) {
+                    NetworkCommand::JoinRoom { room_id, player_name, api_key } => {
+                        if let Err(e) = signaling_client.join_room(
+                            &room_id,
+                            &player_name,
+                            api_key.as_deref(),
+                        ) {
                             log::error!("Failed to join room: {}", e);
+                        }
+                    }
+                    NetworkCommand::ValidateApiKey { api_key } => {
+                        if let Err(e) = signaling_client.validate_api_key(&api_key) {
+                            log::error!("Failed to send ValidateApiKey: {}", e);
                         }
                     }
                     NetworkCommand::LeaveRoom => {
@@ -903,6 +1210,12 @@ async fn network_task(
                     Some(ServerMessage::Welcome { peer_id }) => {
                         let _ = event_tx.send(NetworkEvent::Connected { peer_id });
                     }
+                    Some(ServerMessage::AccountValidated { account_name }) => {
+                        let _ = event_tx.send(NetworkEvent::AccountValidated { account_name });
+                    }
+                    Some(ServerMessage::JoinRejected { reason }) => {
+                        let _ = event_tx.send(NetworkEvent::JoinRejected { reason });
+                    }
                     Some(ServerMessage::RoomJoined { room_id, peers }) => {
                         let _ = incoming_audio_tx.send(IncomingAudioCommand::ResetIncoming);
                         for peer in &peers {
@@ -928,6 +1241,7 @@ async fn network_task(
                         let _ = event_tx.send(NetworkEvent::PeerJoined {
                             peer_id: peer.peer_id,
                             player_name: peer.player_name,
+                            account_name: peer.account_name,
                         });
                     }
                     Some(ServerMessage::PeerLeft { peer_id }) => {
@@ -996,4 +1310,49 @@ async fn network_task(
     }
 
     log::info!("Network task stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pre-seeding `muted_accounts` and then adding a peer whose account
+    /// matches should leave the peer muted immediately — no fresh UI
+    /// interaction required. This is the cross-session behaviour users rely
+    /// on after reloading the addon.
+    #[test]
+    fn auto_mute_on_join_by_account() {
+        let mut muted = HashSet::new();
+        muted.insert("Jerk.1234".to_string());
+
+        let settings = VoiceSettings::default();
+        let mut vm = VoiceManager::with_persistence(DEFAULT_SERVER_URL, settings, muted);
+
+        vm.add_peer("peer-id-a", "Character A", Some("Jerk.1234"))
+            .expect("add_peer");
+        vm.add_peer("peer-id-b", "Character B", Some("Nice.9999"))
+            .expect("add_peer");
+        vm.add_peer("peer-id-c", "Character C", None)
+            .expect("add_peer");
+
+        let peers = vm.get_peers();
+        let by_id: HashMap<String, bool> = peers
+            .into_iter()
+            .map(|p| (p.peer_id, p.is_muted))
+            .collect();
+        assert_eq!(by_id.get("peer-id-a"), Some(&true), "matched account auto-mutes");
+        assert_eq!(by_id.get("peer-id-b"), Some(&false), "unmatched account stays unmuted");
+        assert_eq!(by_id.get("peer-id-c"), Some(&false), "no account stays unmuted");
+    }
+
+    /// `NearbyPeer.account_name` should carry the handle through to the UI.
+    #[test]
+    fn nearby_peer_surfaces_account_name() {
+        let mut vm = VoiceManager::new(DEFAULT_SERVER_URL);
+        vm.add_peer("peer-id", "Char Name", Some("Acc.4242"))
+            .expect("add_peer");
+        let peers = vm.get_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].account_name.as_deref(), Some("Acc.4242"));
+    }
 }

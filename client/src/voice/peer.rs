@@ -11,6 +11,9 @@ const SPEAKING_TIMEOUT: Duration = Duration::from_millis(300);
 pub struct VoicePeer {
     pub peer_id: String,
     pub player_name: String,
+    /// Server-validated GW2 account handle, when the peer supplied a valid
+    /// API key.
+    pub account_name: Option<String>,
     pub position: Position,
     pub front: Position,
     pub volume: f32,
@@ -20,10 +23,11 @@ pub struct VoicePeer {
 }
 
 impl VoicePeer {
-    pub fn new(peer_id: String, player_name: String) -> Result<Self> {
+    pub fn new(peer_id: String, player_name: String, account_name: Option<String>) -> Result<Self> {
         Ok(Self {
             peer_id,
             player_name,
+            account_name,
             position: Position::default(),
             front: Position::new(0.0, 0.0, 1.0),
             volume: 1.0,

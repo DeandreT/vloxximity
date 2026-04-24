@@ -36,7 +36,18 @@ struct AddonState {
 
 impl AddonState {
     fn new() -> anyhow::Result<Self> {
-        let voice_manager = Arc::new(RwLock::new(VoiceManager::new(voice::DEFAULT_SERVER_URL)));
+        // Hydrate persisted settings + mute list from the addon directory
+        // before the voice manager spins up, so initial connection settings
+        // (server URL, API key) are applied to the first room join.
+        let settings = voice::persist::load_settings();
+        let muted_accounts = voice::persist::load_muted_accounts();
+        let server_url = settings.server_url.clone();
+
+        let voice_manager = Arc::new(RwLock::new(VoiceManager::with_persistence(
+            &server_url,
+            settings,
+            muted_accounts,
+        )));
         let settings_window = Arc::new(RwLock::new(SettingsWindow::new()));
 
         Ok(Self {
@@ -106,6 +117,8 @@ fn addon_unload() {
     log(LogLevel::Info, "Vloxximity", "Vloxximity unloading...");
 
     if let Some(state) = AddonState::get() {
+        let snapshot = state.voice_manager.read().settings();
+        voice::persist::save_settings(&snapshot);
         state.voice_manager.write().shutdown();
     }
 

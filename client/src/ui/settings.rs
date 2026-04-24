@@ -1,6 +1,7 @@
 //! ImGui settings window for Vloxximity.
 
 use crate::voice::{VoiceManager, VoiceMode, VoiceSettings};
+use crate::voice::manager::ApiKeyStatus;
 use nexus::imgui::{Condition, InputTextFlags, Selectable, Slider, TreeNodeFlags, Ui, Window};
 
 /// Settings window state
@@ -20,6 +21,9 @@ pub struct SettingsWindow {
     // Pending device selections (device name)
     pending_input_device: Option<String>,
     pending_output_device: Option<String>,
+    // Account tab state
+    api_key_buffer: String,
+    api_key_visible: bool,
 }
 
 impl SettingsWindow {
@@ -37,6 +41,8 @@ impl SettingsWindow {
             pending_server_url: None,
             pending_input_device: None,
             pending_output_device: None,
+            api_key_buffer: String::new(),
+            api_key_visible: false,
         }
     }
 
@@ -115,6 +121,15 @@ impl SettingsWindow {
 
                 ui.text(format!("Status: {}", status_text));
                 ui.text(format!("Peers: {}", voice_manager.peer_count()));
+
+                if let Some(reason) = voice_manager.last_join_rejection() {
+                    ui.text_colored(
+                        [1.0, 0.4, 0.4, 1.0],
+                        format!("[!] Cannot join room: {}", reason),
+                    );
+                    ui.text_disabled("Add or fix your API key under Account below.");
+                }
+
                 ui.separator();
 
                 // Voice mode selection
@@ -295,6 +310,94 @@ impl SettingsWindow {
 
                 ui.separator();
 
+                // Account
+                if ui.collapsing_header("Account", TreeNodeFlags::empty()) {
+                    // Initialize buffer from persisted settings on first view.
+                    if self.api_key_buffer.is_empty() && !new_settings.gw2_api_key.is_empty() {
+                        self.api_key_buffer = new_settings.gw2_api_key.clone();
+                    }
+
+                    match voice_manager.own_account_name() {
+                        Some(name) => ui.text(format!("Detected account (RTAPI): {}", name)),
+                        None => ui.text_disabled("Detected account: (RTAPI not active)"),
+                    }
+
+                    ui.spacing();
+                    ui.text("GW2 API Key (optional — required for persistent mutes)");
+
+                    ui.set_next_item_width(-160.0);
+                    let flags = if self.api_key_visible {
+                        InputTextFlags::empty()
+                    } else {
+                        InputTextFlags::PASSWORD
+                    };
+                    ui.input_text("##gw2_api_key", &mut self.api_key_buffer)
+                        .hint("Paste your GW2 API key (account scope)")
+                        .flags(flags)
+                        .build();
+                    ui.same_line();
+                    if ui.button("Paste##api_key") {
+                        if let Some(text) = ui.clipboard_text() {
+                            self.api_key_buffer = text.trim().to_string();
+                        }
+                    }
+                    ui.same_line();
+                    if ui.checkbox("Show", &mut self.api_key_visible) { /* toggle only */ }
+
+                    if self.api_key_buffer.trim() != new_settings.gw2_api_key.trim() {
+                        if ui.button("Save Key") {
+                            new_settings.gw2_api_key = self.api_key_buffer.trim().to_string();
+                            settings_changed = true;
+                        }
+                        ui.same_line();
+                        if ui.button("Discard") {
+                            self.api_key_buffer = new_settings.gw2_api_key.clone();
+                        }
+                        ui.text_disabled("Unsaved changes. Save, then rejoin a room to validate.");
+                    } else if new_settings.gw2_api_key.is_empty() {
+                        ui.text_disabled("No key set — mutes will be session-only.");
+                    } else {
+                        // Server-reported validation status for the saved
+                        // key. `matches_current` guards against showing a
+                        // stale result right after the user edits.
+                        let status = voice_manager.api_key_status();
+                        let matches = voice_manager.api_key_status_matches_current();
+                        let color_green = [0.2, 1.0, 0.2, 1.0];
+                        let color_red = [1.0, 0.4, 0.4, 1.0];
+                        let color_yellow = [1.0, 0.85, 0.2, 1.0];
+                        match (matches, status) {
+                            (true, ApiKeyStatus::Valid { account_name }) => {
+                                ui.text_colored(
+                                    color_green,
+                                    format!("[OK] Validated — {}", account_name),
+                                );
+                            }
+                            (true, ApiKeyStatus::Invalid { message }) => {
+                                ui.text_colored(
+                                    color_red,
+                                    format!("[!] Rejected — {}", message),
+                                );
+                            }
+                            (true, ApiKeyStatus::Validating) => {
+                                ui.text_colored(
+                                    color_yellow,
+                                    "[...] Validating with server...",
+                                );
+                            }
+                            _ => {
+                                ui.text_disabled(
+                                    "Key saved. Rejoin a room to validate with the server.",
+                                );
+                            }
+                        }
+                    }
+
+                    ui.text_disabled("Server validates the key and broadcasts your account handle");
+                    ui.text_disabled("to peers. Only `account` permission is needed.");
+                }
+
+                ui.separator();
+
                 // Server settings
                 if ui.collapsing_header("Server", TreeNodeFlags::empty()) {
                     // Initialize buffer from current setting if empty
@@ -303,11 +406,17 @@ impl SettingsWindow {
                     }
 
                     ui.text("Server URL:");
-                    ui.set_next_item_width(-1.0);
+                    ui.set_next_item_width(-80.0);
                     ui.input_text("##server_url", &mut self.server_url_buffer)
                         .hint("ws://localhost:3000/ws")
                         .flags(InputTextFlags::empty())
                         .build();
+                    ui.same_line();
+                    if ui.button("Paste##server_url") {
+                        if let Some(text) = ui.clipboard_text() {
+                            self.server_url_buffer = text.trim().to_string();
+                        }
+                    }
 
                     ui.spacing();
 
@@ -352,6 +461,10 @@ impl SettingsWindow {
                                 }
                             }
 
+                            match peer.account_name.as_deref() {
+                                Some(name) => ui.text_disabled(format!("    account: {}", name)),
+                                None => ui.text_disabled("    account: — (session-only mute)"),
+                            }
                             ui.text_disabled(format!(
                                 "    pos ({:.1}, {:.1}, {:.1})",
                                 peer.position.x, peer.position.y, peer.position.z,
@@ -388,6 +501,8 @@ impl SettingsWindow {
 
         // Apply pending settings
         if let Some(settings) = self.pending_settings.take() {
+            let old_api_key = voice_manager.settings().gw2_api_key.clone();
+            let new_api_key = settings.gw2_api_key.clone();
             voice_manager.update_settings(|s| {
                 s.mode = settings.mode;
                 s.input_volume = settings.input_volume;
@@ -399,7 +514,16 @@ impl SettingsWindow {
                 s.directional_audio_enabled = settings.directional_audio_enabled;
                 s.spatial_3d_enabled = settings.spatial_3d_enabled;
                 s.show_peer_markers = settings.show_peer_markers;
+                s.gw2_api_key = settings.gw2_api_key;
             });
+            crate::voice::persist::save_settings(&voice_manager.settings());
+
+            // If the API key actually changed, ask the server to
+            // re-validate right away instead of waiting for the next room
+            // rejoin.
+            if old_api_key.trim() != new_api_key.trim() {
+                voice_manager.revalidate_saved_api_key();
+            }
         }
 
         // Apply pending mutes

@@ -18,6 +18,13 @@ pub enum ClientMessage {
     JoinRoom {
         room_id: String,
         player_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+    },
+    /// Ask the server to validate a GW2 API key without joining a room.
+    /// Server replies with `AccountValidated`.
+    ValidateApiKey {
+        api_key: String,
     },
     /// Leave current room
     LeaveRoom,
@@ -38,10 +45,21 @@ pub enum ServerMessage {
     Welcome {
         peer_id: String,
     },
+    /// Server-validated GW2 account handle for the local peer. `None`
+    /// when the user didn't supply an API key or validation failed.
+    /// Sent once per JoinRoom, just before the matching `RoomJoined`.
+    AccountValidated {
+        #[serde(default)]
+        account_name: Option<String>,
+    },
     /// Successfully joined room
     RoomJoined {
         room_id: String,
         peers: Vec<PeerInfo>,
+    },
+    /// JoinRoom rejected by the server (missing/invalid API key, etc.).
+    JoinRejected {
+        reason: String,
     },
     /// A peer joined the room
     PeerJoined {
@@ -75,6 +93,10 @@ pub enum ServerMessage {
 pub struct PeerInfo {
     pub peer_id: String,
     pub player_name: String,
+    /// GW2 account handle as validated by the server (e.g. `Example.1234`).
+    /// `None` when the peer joined without an API key or validation failed.
+    #[serde(default)]
+    pub account_name: Option<String>,
     pub position: Option<Position>,
     pub front: Option<Position>,
 }
@@ -248,11 +270,17 @@ impl SignalingClient {
     }
 
     /// Join a room
-    pub fn join_room(&self, room_id: &str, player_name: &str) -> Result<()> {
-        log::info!("Client joining room '{}' as '{}'", room_id, player_name);
+    pub fn join_room(&self, room_id: &str, player_name: &str, api_key: Option<&str>) -> Result<()> {
+        log::info!(
+            "Client joining room '{}' as '{}'",
+            room_id,
+            player_name,
+            if api_key.is_some() { "yes" } else { "no" }
+        );
         let res = self.send(ClientMessage::JoinRoom {
             room_id: room_id.to_string(),
             player_name: player_name.to_string(),
+            api_key: api_key.map(|k| k.to_string()),
         });
         if res.is_err() {
             log::warn!("Failed to send JoinRoom message: {:?}", res.as_ref().err());
@@ -263,6 +291,13 @@ impl SignalingClient {
     /// Leave current room
     pub fn leave_room(&self) -> Result<()> {
         self.send(ClientMessage::LeaveRoom)
+    }
+
+    /// Ask the server to validate an API key without touching room state.
+    pub fn validate_api_key(&self, api_key: &str) -> Result<()> {
+        self.send(ClientMessage::ValidateApiKey {
+            api_key: api_key.to_string(),
+        })
     }
 
     /// Update position
