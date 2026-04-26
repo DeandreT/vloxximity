@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 # Web framework
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -34,11 +36,8 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 
-# TURN credential generation
-hmac = "0.12"
-sha1 = "0.10"
+# GW2 API key cache key derivation
 sha2 = "0.10"
-base64 = "0.22"
 
 # Audio codec for server-side fake player
 mousiki = "0.2"

@@ -56,7 +56,9 @@ impl Position {
     }
 }
 
-/// Events broadcast within a room
+/// Events broadcast within a room. The `Peer*` prefix is deliberate — it
+/// names the subject (a peer, not the room itself).
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub enum RoomEvent {
     PeerJoined {
@@ -75,23 +77,6 @@ pub enum RoomEvent {
     PeerAudio {
         peer_id: String,
         data: Vec<u8>,
-    },
-    SdpOffer {
-        from_peer: String,
-        to_peer: String,
-        sdp: String,
-    },
-    SdpAnswer {
-        from_peer: String,
-        to_peer: String,
-        sdp: String,
-    },
-    IceCandidate {
-        from_peer: String,
-        to_peer: String,
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
     },
 }
 
@@ -352,51 +337,6 @@ impl RoomManager {
                     }
                 }
             }
-        }
-    }
-
-    /// Forward SDP offer
-    pub fn forward_sdp_offer(&self, from_peer: &str, to_peer: &str, sdp: &str) {
-        if let Some(target) = self.peers.get(to_peer) {
-            let event = RoomEvent::SdpOffer {
-                from_peer: from_peer.to_string(),
-                to_peer: to_peer.to_string(),
-                sdp: sdp.to_string(),
-            };
-            let _ = target.tx.send(event);
-        }
-    }
-
-    /// Forward SDP answer
-    pub fn forward_sdp_answer(&self, from_peer: &str, to_peer: &str, sdp: &str) {
-        if let Some(target) = self.peers.get(to_peer) {
-            let event = RoomEvent::SdpAnswer {
-                from_peer: from_peer.to_string(),
-                to_peer: to_peer.to_string(),
-                sdp: sdp.to_string(),
-            };
-            let _ = target.tx.send(event);
-        }
-    }
-
-    /// Forward ICE candidate
-    pub fn forward_ice_candidate(
-        &self,
-        from_peer: &str,
-        to_peer: &str,
-        candidate: &str,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    ) {
-        if let Some(target) = self.peers.get(to_peer) {
-            let event = RoomEvent::IceCandidate {
-                from_peer: from_peer.to_string(),
-                to_peer: to_peer.to_string(),
-                candidate: candidate.to_string(),
-                sdp_mid,
-                sdp_mline_index,
-            };
-            let _ = target.tx.send(event);
         }
     }
 

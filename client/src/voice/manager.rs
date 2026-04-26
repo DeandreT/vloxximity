@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::thread::AudioCommand;
 use crate::audio::{AudioThread, IncomingAudioCommand, OpusEncoder, VoiceActivityDetector};
-use crate::network::signaling::{ConnectionState, PeerInfo, ServerMessage, SignalingClient};
+use crate::network::{ConnectionState, PeerInfo, ServerMessage, SignalingClient};
 use crate::position::MumbleLink;
 
 use super::peer::VoicePeer;
@@ -71,9 +71,7 @@ pub struct VoiceSettings {
     pub spatial_3d_enabled: bool,
     pub show_peer_markers: bool,
     pub server_url: String,
-    /// Sent to the signaling server so it can validate
-    /// the caller's account name against the GW2 REST API and broadcast the
-    /// verified handle to the room. Only the `account` permission is needed.
+    #[serde(skip)]
     pub gw2_api_key: String,
 }
 

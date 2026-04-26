@@ -1,114 +1,19 @@
+//! WebSocket client. Owns the connection to the server and routes
+//! incoming `ServerMessage` events out via an `mpsc` channel.
+
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::position::Position;
 
-const AUDIO_FRAME_KIND: u8 = 1;
-
-/// Messages sent from client to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    /// Join a room with instance hash
-    JoinRoom {
-        room_id: String,
-        player_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        api_key: Option<String>,
-    },
-    /// Ask the server to validate a GW2 API key without joining a room.
-    /// Server replies with `AccountValidated`.
-    ValidateApiKey {
-        api_key: String,
-    },
-    /// Leave current room
-    LeaveRoom,
-    /// Update player position
-    UpdatePosition {
-        position: Position,
-        front: Position,
-    },
-    /// Heartbeat/keepalive
-    Ping,
-}
-
-/// Messages received from server
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    /// Connection established, assigned peer ID
-    Welcome {
-        peer_id: String,
-    },
-    /// Server-validated GW2 account handle for the local peer. `None`
-    /// when the user didn't supply an API key or validation failed.
-    /// Sent once per JoinRoom, just before the matching `RoomJoined`.
-    AccountValidated {
-        #[serde(default)]
-        account_name: Option<String>,
-    },
-    /// Successfully joined room
-    RoomJoined {
-        room_id: String,
-        peers: Vec<PeerInfo>,
-    },
-    /// JoinRoom rejected by the server (missing/invalid API key, etc.).
-    JoinRejected {
-        reason: String,
-    },
-    /// A peer joined the room
-    PeerJoined {
-        peer: PeerInfo,
-    },
-    /// A peer left the room
-    PeerLeft {
-        peer_id: String,
-    },
-    /// Peer position update
-    PeerPosition {
-        peer_id: String,
-        position: Position,
-        front: Position,
-    },
-    /// Audio data from a peer
-    PeerAudio {
-        peer_id: String,
-        data: Vec<u8>,
-    },
-    /// Error message
-    Error {
-        message: String,
-    },
-    /// Heartbeat response
-    Pong,
-}
-
-/// Information about a peer in the room
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub peer_id: String,
-    pub player_name: String,
-    /// GW2 account handle as validated by the server (e.g. `Example.1234`).
-    /// `None` when the peer joined without an API key or validation failed.
-    #[serde(default)]
-    pub account_name: Option<String>,
-    pub position: Option<Position>,
-    pub front: Option<Position>,
-}
-
-/// Connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    Reconnecting,
-}
+use super::protocol::{
+    decode_server_audio_frame, encode_client_audio_frame, ClientMessage, ConnectionState,
+    ServerMessage,
+};
 
 /// Signaling client for WebSocket communication
 pub struct SignalingClient {
@@ -272,7 +177,7 @@ impl SignalingClient {
     /// Join a room
     pub fn join_room(&self, room_id: &str, player_name: &str, api_key: Option<&str>) -> Result<()> {
         log::info!(
-            "Client joining room '{}' as '{}'",
+            "Client joining room '{}' as '{}' api_key={}",
             room_id,
             player_name,
             if api_key.is_some() { "yes" } else { "no" }
@@ -348,27 +253,4 @@ impl Default for SignalingClient {
     fn default() -> Self {
         Self::new("wss://0.0.0.0:8080")
     }
-}
-
-fn encode_client_audio_frame(audio: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(1 + audio.len());
-    frame.push(AUDIO_FRAME_KIND);
-    frame.extend_from_slice(audio);
-    frame
-}
-
-fn decode_server_audio_frame(data: &[u8]) -> Option<(String, Vec<u8>)> {
-    let (&kind, rest) = data.split_first()?;
-    if kind != AUDIO_FRAME_KIND || rest.len() < 2 {
-        return None;
-    }
-
-    let peer_len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
-    if rest.len() < 2 + peer_len {
-        return None;
-    }
-
-    let peer_id = std::str::from_utf8(&rest[2..2 + peer_len]).ok()?.to_string();
-    let audio = rest[2 + peer_len..].to_vec();
-    Some((peer_id, audio))
 }

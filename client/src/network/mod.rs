@@ -1,3 +1,5 @@
-pub mod signaling;
+pub mod protocol;
+pub mod ws;
 
-pub use signaling::SignalingClient;
+pub use protocol::{ClientMessage, ConnectionState, PeerInfo, ServerMessage};
+pub use ws::SignalingClient;

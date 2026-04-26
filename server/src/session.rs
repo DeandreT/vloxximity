@@ -1,139 +1,29 @@
-//! WebSocket signaling protocol handling.
+//! Per-peer WebSocket session: lifecycle, dispatch, validation, and rate
+//! limiting. Wire types and frame codec live in `protocol`.
 
 use axum::extract::ws::{Message, WebSocket};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures::{SinkExt, StreamExt};
-use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
-use sha1::Sha1;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::rooms::{Position, RoomEvent};
+use crate::protocol::{
+    decode_client_audio_frame, encode_server_audio_frame, ClientMessage, PeerInfo, ServerMessage,
+};
+use crate::rate_limit::PeerRateLimits;
+use crate::rooms::RoomEvent;
 use crate::AppState;
 
-const AUDIO_FRAME_KIND: u8 = 1;
-
-/// Messages from client to server
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    JoinRoom {
-        room_id: String,
-        player_name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        api_key: Option<String>,
-    },
-    ValidateApiKey {
-        api_key: String,
-    },
-    LeaveRoom,
-    UpdatePosition {
-        position: Position,
-        front: Position,
-    },
-    SdpOffer {
-        target_peer: String,
-        sdp: String,
-    },
-    SdpAnswer {
-        target_peer: String,
-        sdp: String,
-    },
-    IceCandidate {
-        target_peer: String,
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    },
-    RequestTurnCredentials,
-    Ping,
-}
-
-/// Messages from server to client
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    Welcome {
-        peer_id: String,
-    },
-    AccountValidated {
-        #[serde(default)]
-        account_name: Option<String>,
-    },
-    RoomJoined {
-        room_id: String,
-        peers: Vec<PeerInfo>,
-    },
-    JoinRejected {
-        reason: String,
-    },
-    PeerJoined {
-        peer: PeerInfo,
-    },
-    PeerLeft {
-        peer_id: String,
-    },
-    PeerPosition {
-        peer_id: String,
-        position: Position,
-        front: Position,
-    },
-    SdpOffer {
-        from_peer: String,
-        sdp: String,
-    },
-    SdpAnswer {
-        from_peer: String,
-        sdp: String,
-    },
-    IceCandidate {
-        from_peer: String,
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    },
-    TurnCredentials {
-        username: String,
-        credential: String,
-        urls: Vec<String>,
-        ttl: u64,
-    },
-    Error {
-        message: String,
-    },
-    Pong,
-}
+/// Length caps on string fields. Enforced before any DB / API work to keep
+/// a misbehaving peer from spending unbounded CPU/memory on the server.
+const MAX_ROOM_ID_LEN: usize = 64;
+const MAX_PLAYER_NAME_LEN: usize = 64;
+const MAX_API_KEY_LEN: usize = 256;
 
 enum OutgoingWsMessage {
     Text(ServerMessage),
     Binary(Vec<u8>),
 }
 
-/// Peer info for room listing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub peer_id: String,
-    pub player_name: String,
-    #[serde(default)]
-    pub account_name: Option<String>,
-    pub position: Option<Position>,
-    pub front: Option<Position>,
-}
-
-impl From<crate::rooms::PeerInfo> for PeerInfo {
-    fn from(p: crate::rooms::PeerInfo) -> Self {
-        Self {
-            peer_id: p.peer_id,
-            player_name: p.player_name,
-            account_name: p.account_name,
-            position: p.position,
-            front: p.front,
-        }
-    }
-}
-
-/// Handle a WebSocket connection
+/// Handle a WebSocket connection for one peer until it closes.
 pub async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -175,7 +65,7 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
                                         }
                                     }
                                     OutgoingWsMessage::Binary(data) => {
-                                        if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                                        if ws_sender.send(Message::Binary(data)).await.is_err() {
                                             break;
                                         }
                                     }
@@ -202,20 +92,47 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
     let peer_id_in = peer_id.clone();
     let state_in = state.clone();
     let direct_tx_in = direct_tx.clone();
+    let mut rates = PeerRateLimits::new();
 
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(text) => {
-                match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(client_msg) => {
-                        handle_client_message(&peer_id_in, client_msg, &state_in, &direct_tx_in).await;
-                    }
+                let client_msg = match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(m) => m,
                     Err(err) => {
-                        tracing::warn!("Failed to parse client message from {}: {} -- err: {}", peer_id_in, text, err);
+                        tracing::warn!(
+                            "Failed to parse client message from {}: err={}",
+                            peer_id_in, err
+                        );
+                        continue;
                     }
+                };
+                if !validate_message_lengths(&peer_id_in, &client_msg) {
+                    continue;
                 }
+                if !apply_rate_limit(&peer_id_in, &client_msg, &mut rates) {
+                    if rates.record_overage() {
+                        tracing::warn!(
+                            "Disconnecting {} after repeated rate-limit hits",
+                            peer_id_in
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                handle_client_message(&peer_id_in, client_msg, &state_in, &direct_tx_in).await;
             }
             Message::Binary(data) => {
+                if !rates.audio.try_take() {
+                    if rates.record_overage() {
+                        tracing::warn!(
+                            "Disconnecting {} after repeated audio rate-limit hits",
+                            peer_id_in
+                        );
+                        break;
+                    }
+                    continue;
+                }
                 handle_client_binary_message(&peer_id_in, &data, &state_in).await;
             }
             Message::Close(_) => break,
@@ -263,29 +180,6 @@ fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<Outgoin
                 return None;
             }
             Some(OutgoingWsMessage::Binary(encode_server_audio_frame(&peer_id, &data)))
-        }
-        RoomEvent::SdpOffer { from_peer, to_peer, sdp } => {
-            if to_peer != self_peer_id {
-                return None;
-            }
-            Some(OutgoingWsMessage::Text(ServerMessage::SdpOffer { from_peer, sdp }))
-        }
-        RoomEvent::SdpAnswer { from_peer, to_peer, sdp } => {
-            if to_peer != self_peer_id {
-                return None;
-            }
-            Some(OutgoingWsMessage::Text(ServerMessage::SdpAnswer { from_peer, sdp }))
-        }
-        RoomEvent::IceCandidate { from_peer, to_peer, candidate, sdp_mid, sdp_mline_index } => {
-            if to_peer != self_peer_id {
-                return None;
-            }
-            Some(OutgoingWsMessage::Text(ServerMessage::IceCandidate {
-                from_peer,
-                candidate,
-                sdp_mid,
-                sdp_mline_index,
-            }))
         }
     }
 }
@@ -378,100 +272,142 @@ async fn handle_client_message(
             state.rooms.update_position(peer_id, position, front);
         }
 
-        ClientMessage::SdpOffer { target_peer, sdp } => {
-            state.rooms.forward_sdp_offer(peer_id, &target_peer, &sdp);
-        }
-
-        ClientMessage::SdpAnswer { target_peer, sdp } => {
-            state.rooms.forward_sdp_answer(peer_id, &target_peer, &sdp);
-        }
-
-        ClientMessage::IceCandidate {
-            target_peer,
-            candidate,
-            sdp_mid,
-            sdp_mline_index,
-        } => {
-            state.rooms.forward_ice_candidate(
-                peer_id,
-                &target_peer,
-                &candidate,
-                sdp_mid,
-                sdp_mline_index,
-            );
-        }
-
-        ClientMessage::RequestTurnCredentials => {
-            let creds = generate_turn_credentials(&state.config.turn_secret, state.config.turn_ttl);
-            let response = ServerMessage::TurnCredentials {
-                username: creds.0,
-                credential: creds.1,
-                urls: state.config.turn_urls.clone(),
-                ttl: state.config.turn_ttl,
-            };
-            let _ = direct_tx.send(response);
-        }
-
         ClientMessage::Ping => {
             let _ = direct_tx.send(ServerMessage::Pong);
         }
     }
 }
 
-fn decode_client_audio_frame(data: &[u8]) -> Option<&[u8]> {
-    let (&kind, payload) = data.split_first()?;
-    if kind != AUDIO_FRAME_KIND || payload.is_empty() {
-        return None;
+/// Reject messages whose string fields exceed our caps. Returns false to drop.
+fn validate_message_lengths(peer_id: &str, msg: &ClientMessage) -> bool {
+    let too_long = |what: &str, len: usize, max: usize| -> bool {
+        if len > max {
+            tracing::warn!(
+                "Dropping {} from {}: {} length {} > cap {}",
+                msg_kind(msg), peer_id, what, len, max
+            );
+            true
+        } else {
+            false
+        }
+    };
+    match msg {
+        ClientMessage::JoinRoom { room_id, player_name, api_key } => {
+            if too_long("room_id", room_id.len(), MAX_ROOM_ID_LEN) { return false; }
+            if too_long("player_name", player_name.len(), MAX_PLAYER_NAME_LEN) { return false; }
+            if let Some(key) = api_key {
+                if too_long("api_key", key.len(), MAX_API_KEY_LEN) { return false; }
+            }
+            true
+        }
+        ClientMessage::ValidateApiKey { api_key } => {
+            !too_long("api_key", api_key.len(), MAX_API_KEY_LEN)
+        }
+        _ => true,
     }
-    Some(payload)
 }
 
-fn encode_server_audio_frame(peer_id: &str, audio: &[u8]) -> Vec<u8> {
-    let peer_id_bytes = peer_id.as_bytes();
-    let peer_id_len = u16::try_from(peer_id_bytes.len()).unwrap_or(u16::MAX);
-    let peer_id_len_usize = peer_id_len as usize;
-
-    let mut frame = Vec::with_capacity(1 + 2 + peer_id_len_usize + audio.len());
-    frame.push(AUDIO_FRAME_KIND);
-    frame.extend_from_slice(&peer_id_len.to_le_bytes());
-    frame.extend_from_slice(&peer_id_bytes[..peer_id_len_usize]);
-    frame.extend_from_slice(audio);
-    frame
+/// Charge the appropriate token bucket. Returns false when the bucket is
+/// empty (caller drops the message and records an overage).
+fn apply_rate_limit(peer_id: &str, msg: &ClientMessage, rates: &mut PeerRateLimits) -> bool {
+    let bucket = match msg {
+        ClientMessage::JoinRoom { .. } => &mut rates.join_room,
+        ClientMessage::ValidateApiKey { .. } => &mut rates.validate_api_key,
+        ClientMessage::UpdatePosition { .. } => &mut rates.update_position,
+        // LeaveRoom and Ping are cheap and bounded by the connection itself.
+        ClientMessage::LeaveRoom | ClientMessage::Ping => return true,
+    };
+    if bucket.try_take() {
+        true
+    } else {
+        tracing::warn!("Rate limit hit on {} from {}", msg_kind(msg), peer_id);
+        false
+    }
 }
 
-/// Generate time-limited TURN credentials
-/// Uses the coturn REST API credential format
-fn generate_turn_credentials(secret: &str, ttl: u64) -> (String, String) {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + ttl;
-
-    let username = format!("{}:vloxximity", timestamp);
-
-    // Generate HMAC-SHA1 credential
-    type HmacSha1 = Hmac<Sha1>;
-    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(username.as_bytes());
-    let result = mac.finalize();
-    let credential = BASE64.encode(result.into_bytes());
-
-    (username, credential)
+fn msg_kind(msg: &ClientMessage) -> &'static str {
+    match msg {
+        ClientMessage::JoinRoom { .. } => "JoinRoom",
+        ClientMessage::ValidateApiKey { .. } => "ValidateApiKey",
+        ClientMessage::LeaveRoom => "LeaveRoom",
+        ClientMessage::UpdatePosition { .. } => "UpdatePosition",
+        ClientMessage::Ping => "Ping",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn join_room(room: &str, name: &str, key: Option<&str>) -> ClientMessage {
+        ClientMessage::JoinRoom {
+            room_id: room.to_string(),
+            player_name: name.to_string(),
+            api_key: key.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn test_turn_credentials() {
-        let (username, credential) = generate_turn_credentials("test-secret", 86400);
+    fn length_caps_pass_normal_messages() {
+        assert!(validate_message_lengths("p", &join_room("room", "Alice", Some("k"))));
+        assert!(validate_message_lengths("p", &join_room("room", "Alice", None)));
+        assert!(validate_message_lengths(
+            "p",
+            &ClientMessage::ValidateApiKey { api_key: "k".to_string() }
+        ));
+        assert!(validate_message_lengths("p", &ClientMessage::LeaveRoom));
+        assert!(validate_message_lengths("p", &ClientMessage::Ping));
+    }
 
-        // Username should contain timestamp
-        assert!(username.contains(":vloxximity"));
+    #[test]
+    fn length_caps_reject_oversize_room_id() {
+        let too_long = "x".repeat(MAX_ROOM_ID_LEN + 1);
+        assert!(!validate_message_lengths("p", &join_room(&too_long, "A", None)));
+    }
 
-        // Credential should be base64
-        assert!(BASE64.decode(&credential).is_ok());
+    #[test]
+    fn length_caps_reject_oversize_player_name() {
+        let too_long = "x".repeat(MAX_PLAYER_NAME_LEN + 1);
+        assert!(!validate_message_lengths("p", &join_room("r", &too_long, None)));
+    }
+
+    #[test]
+    fn length_caps_reject_oversize_api_key_in_join() {
+        let too_long = "x".repeat(MAX_API_KEY_LEN + 1);
+        assert!(!validate_message_lengths(
+            "p",
+            &join_room("r", "A", Some(&too_long))
+        ));
+    }
+
+    #[test]
+    fn length_caps_reject_oversize_api_key_in_validate() {
+        let too_long = "x".repeat(MAX_API_KEY_LEN + 1);
+        assert!(!validate_message_lengths(
+            "p",
+            &ClientMessage::ValidateApiKey { api_key: too_long }
+        ));
+    }
+
+    #[test]
+    fn length_caps_accept_at_boundary() {
+        let exact = "x".repeat(MAX_API_KEY_LEN);
+        assert!(validate_message_lengths(
+            "p",
+            &ClientMessage::ValidateApiKey { api_key: exact }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_charges_correct_bucket() {
+        let mut rates = PeerRateLimits::new();
+        // JoinRoom bucket has burst=2; third call within the same instant
+        // must be rejected.
+        assert!(apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+        assert!(apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+        assert!(!apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+        // LeaveRoom and Ping bypass the buckets — they should still pass.
+        assert!(apply_rate_limit("p", &ClientMessage::LeaveRoom, &mut rates));
+        assert!(apply_rate_limit("p", &ClientMessage::Ping, &mut rates));
     }
 }

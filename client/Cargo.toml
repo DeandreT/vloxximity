@@ -2,7 +2,7 @@
 #
 # Build with MSVC (recommended - no runtime dependencies):
 #   cargo xwin build --target x86_64-pc-windows-msvc --release
-#   Output: target/x86_64-pc-windows-msvc/release/chatti_client.dll
+#   Output: target/x86_64-pc-windows-msvc/release/vloxximity_client.dll
 #
 # Install tools:
 #   cargo install cargo-xwin
@@ -62,4 +62,10 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 once_cell = "1"
 bytes = "1"
+
+# OS-keyring storage for the GW2 API key. Only compiled for the shipping
+# target — keeps host-side `cargo test` working on Linux without dragging
+# in Windows-only transitive deps.
+[target.'cfg(windows)'.dependencies]
+keyring = "3"
 

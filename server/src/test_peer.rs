@@ -158,7 +158,7 @@ async fn supervisor(rooms: Arc<RoomManager>, mode: TestPeerMode) {
                             peers.iter().map(|p| p.peer_id.as_str()).collect();
                         occupants
                             .iter()
-                            .all(|occ| fake_ids.iter().any(|fid| *fid == occ.as_str()))
+                            .all(|occ| fake_ids.contains(&occ.as_str()))
                     }
                 }
             })

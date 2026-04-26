@@ -1,10 +1,12 @@
-//! Vloxximity Signaling Server
+//! Vloxximity Relay Server
 //!
-//! Handles room management, position tracking, and WebRTC signaling for Vloxximity voice chat.
+//! Handles room management, position tracking, and audio relay for Vloxximity voice chat.
 
 mod gw2;
+mod protocol;
+mod rate_limit;
 mod rooms;
-mod signaling;
+mod session;
 mod test_peer;
 
 use axum::{
@@ -14,36 +16,20 @@ use axum::{
     routing::get,
     Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use rooms::RoomManager;
-use signaling::handle_socket;
+use session::handle_socket;
 use test_peer::TestPeerMode;
 
 /// Server configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
-    pub turn_secret: String,
-    pub turn_urls: Vec<String>,
-    pub turn_ttl: u64,
     pub test_peer_mode: Option<TestPeerMode>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            turn_secret: std::env::var("TURN_SECRET").unwrap_or_else(|_| "vloxximity-secret".to_string()),
-            turn_urls: vec![
-                "turn:turn.vloxximity.example.com:3478".to_string(),
-                "turns:turn.vloxximity.example.com:5349".to_string(),
-            ],
-            turn_ttl: 86400, // 24 hours
-            test_peer_mode: None,
-        }
-    }
 }
 
 /// Application state shared across handlers
@@ -63,7 +49,11 @@ async fn main() {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    info!("Vloxximity Signaling Server starting...");
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("install default rustls CryptoProvider");
+
+    info!("Vloxximity Relay Server starting...");
 
     let test_peer_mode = parse_test_peer_flag(std::env::args().skip(1));
     if let Some(mode) = test_peer_mode {
@@ -71,8 +61,7 @@ async fn main() {
     }
 
     // Create application state
-    let mut config = ServerConfig::default();
-    config.test_peer_mode = test_peer_mode;
+    let config = ServerConfig { test_peer_mode };
     let http = reqwest::Client::builder()
         .user_agent("vloxximity-server/0.1")
         .build()
@@ -96,15 +85,37 @@ async fn main() {
 
     // Run server
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    info!("Listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    match (
+        std::env::var("VLOXXIMITY_TLS_CERT").ok(),
+        std::env::var("VLOXXIMITY_TLS_KEY").ok(),
+    ) {
+        (Some(cert), Some(key)) => {
+            let tls = RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .expect("loading TLS cert/key");
+            info!("Listening on {} (TLS)", addr);
+            axum_server::bind_rustls(addr, tls)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        }
+        _ => {
+            warn!("TLS disabled — set VLOXXIMITY_TLS_CERT and VLOXXIMITY_TLS_KEY for production");
+            info!("Listening on {} (plaintext)", addr);
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
+    }
 }
+
+const MAX_WS_MESSAGE_SIZE: usize = 64 * 1024;
 
 /// WebSocket upgrade handler
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_SIZE)
+        .max_frame_size(MAX_WS_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_socket(socket, state))
 }
 
 /// Health check endpoint
