@@ -3,10 +3,13 @@
 //! Handles room management, position tracking, and audio relay for Vloxximity voice chat.
 
 mod gw2;
+mod limits;
 mod protocol;
 mod rate_limit;
 mod rooms;
 mod session;
+mod squad;
+mod sweeper;
 mod test_peer;
 
 use axum::{
@@ -24,6 +27,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use rooms::RoomManager;
 use session::handle_socket;
+use squad::SquadRegistry;
 use test_peer::TestPeerMode;
 
 /// Server configuration
@@ -36,6 +40,7 @@ pub struct ServerConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub rooms: Arc<RoomManager>,
+    pub squads: Arc<SquadRegistry>,
     pub config: Arc<ServerConfig>,
     pub http: reqwest::Client,
     pub gw2_cache: gw2::Gw2Cache,
@@ -68,10 +73,13 @@ async fn main() {
         .expect("reqwest client build");
     let state = AppState {
         rooms: Arc::new(RoomManager::new()),
+        squads: Arc::new(SquadRegistry::new()),
         config: Arc::new(config),
         http,
         gw2_cache: gw2::new_cache(),
     };
+
+    sweeper::spawn_sweeper(state.rooms.clone(), state.squads.clone());
 
     if let Some(mode) = state.config.test_peer_mode {
         test_peer::spawn_supervisor(state.rooms.clone(), mode);

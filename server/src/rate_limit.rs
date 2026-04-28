@@ -45,6 +45,7 @@ pub struct PeerRateLimits {
     pub validate_api_key: TokenBucket,
     pub update_position: TokenBucket,
     pub audio: TokenBucket,
+    pub identify_group: TokenBucket,
     overage_window_start: Instant,
     overage_count: u32,
 }
@@ -52,10 +53,17 @@ pub struct PeerRateLimits {
 impl PeerRateLimits {
     pub fn new() -> Self {
         Self {
-            join_room: TokenBucket::new(1.0, 2.0),
+            // Players chain waypoints across maps quickly — each waypoint
+            // is a LeaveRoom + JoinRoom pair. A burst of 8 covers a tight
+            // 4-jump sequence; sustained 2/s covers slower chained travel.
+            join_room: TokenBucket::new(2.0, 8.0),
             validate_api_key: TokenBucket::new(1.0, 2.0),
             update_position: TokenBucket::new(30.0, 60.0),
             audio: TokenBucket::new(60.0, 120.0),
+            // RTAPI-driven squad reports. Coalesced client-side via
+            // debounce; a burst of 5 covers rapid join/leave flurries
+            // when the squad is forming.
+            identify_group: TokenBucket::new(0.5, 5.0),
             overage_window_start: Instant::now(),
             overage_count: 0,
         }

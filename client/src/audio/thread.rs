@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::position::{Position, Transform};
 use crate::voice::mixer::AudioMixer;
+use crate::voice::room_type::{RoomType, RoomTypeVolumes};
 
 use super::capture::{AudioCapture, FRAME_SIZE, SAMPLE_RATE};
 use super::codec::OpusDecoder;
@@ -47,12 +48,23 @@ pub enum IncomingAudioCommand {
         directional_audio_enabled: bool,
         spatial_3d_enabled: bool,
     },
+    /// Per-room-type playback gains. Pushed alongside `SetPlaybackSettings`
+    /// when the user moves a room-volume slider.
+    SetRoomTypeVolumes(RoomTypeVolumes),
     UpsertPeer {
         peer_id: String,
         player_name: String,
     },
+    /// Drop every per-room playback stream for this peer (e.g. peer
+    /// disconnected entirely).
     RemovePeer {
         peer_id: String,
+    },
+    /// Drop a single (peer, room) playback stream while the peer remains
+    /// reachable in other rooms.
+    RemovePeerFromRoom {
+        peer_id: String,
+        room_id: String,
     },
     SetPeerPosition {
         peer_id: String,
@@ -64,12 +76,17 @@ pub enum IncomingAudioCommand {
         position: Position,
         front: Position,
     },
+    /// Push an Opus frame for `(peer_id, room_id)`. Each (peer, room)
+    /// pair has its own decoder and jitter buffer so the same peer can
+    /// send distinct streams into multiple rooms simultaneously.
     PushPeerOpus {
         peer_id: String,
+        room_id: String,
         data: Vec<u8>,
     },
     PushPeerPcm {
         peer_id: String,
+        room_id: String,
         data: Vec<f32>,
     },
     SetPeerMuted {
@@ -209,12 +226,21 @@ impl JitterBuffer {
     }
 }
 
+/// Per-peer state shared across every room the local client receives audio
+/// from this peer in. Position, mute state, and volume are peer-global —
+/// only the decode path is per-room (each (peer, room) pair gets its own
+/// decoder + jitter buffer + spatial smoothing state).
 struct PlaybackPeer {
     player_name: String,
     position: Position,
     front: Position,
     volume: f32,
     is_muted: bool,
+    streams: HashMap<String, PeerRoomStream>,
+}
+
+struct PeerRoomStream {
+    room_type: Option<RoomType>,
     decoder: OpusDecoder,
     jitter_buffer: JitterBuffer,
     last_audio_time: Instant,
@@ -223,19 +249,15 @@ struct PlaybackPeer {
 }
 
 impl PlaybackPeer {
-    fn new(_peer_id: String, player_name: String) -> Result<Self> {
-        Ok(Self {
+    fn new(_peer_id: String, player_name: String) -> Self {
+        Self {
             player_name,
             position: Position::default(),
             front: Position::new(0.0, 0.0, 1.0),
             volume: 1.0,
             is_muted: false,
-            decoder: OpusDecoder::new()?,
-            jitter_buffer: JitterBuffer::new(3, 10),
-            last_audio_time: Instant::now(),
-            last_distance_log: Instant::now() - Duration::from_secs(10),
-            spatial: SpatialState::new(),
-        })
+            streams: HashMap::new(),
+        }
     }
 
     fn update_position(&mut self, position: Position, front: Position) {
@@ -243,28 +265,58 @@ impl PlaybackPeer {
         self.front = front;
     }
 
-    fn push_opus(&mut self, data: &[u8]) -> Result<()> {
-        let samples = self.decoder.decode(data)?;
-        self.push_pcm(samples);
+    fn ensure_stream(&mut self, room_id: &str) -> Result<&mut PeerRoomStream> {
+        if !self.streams.contains_key(room_id) {
+            let stream = PeerRoomStream {
+                room_type: RoomType::from_room_id(room_id),
+                decoder: OpusDecoder::new()?,
+                jitter_buffer: JitterBuffer::new(3, 10),
+                last_audio_time: Instant::now(),
+                last_distance_log: Instant::now() - Duration::from_secs(10),
+                spatial: SpatialState::new(),
+            };
+            self.streams.insert(room_id.to_string(), stream);
+        }
+        Ok(self.streams.get_mut(room_id).expect("stream just inserted"))
+    }
+
+    fn push_opus(&mut self, room_id: &str, data: &[u8]) -> Result<()> {
+        let stream = self.ensure_stream(room_id)?;
+        let samples = stream.decoder.decode(data)?;
+        stream.jitter_buffer.push(samples);
+        stream.last_audio_time = Instant::now();
         Ok(())
     }
 
-    fn push_pcm(&mut self, samples: Vec<f32>) {
-        self.jitter_buffer.push(samples);
-        self.last_audio_time = Instant::now();
+    fn push_pcm(&mut self, room_id: &str, samples: Vec<f32>) -> Result<()> {
+        let stream = self.ensure_stream(room_id)?;
+        stream.jitter_buffer.push(samples);
+        stream.last_audio_time = Instant::now();
+        Ok(())
     }
 
-    fn clear_buffer(&mut self) {
-        self.jitter_buffer.clear();
+    fn clear_buffers(&mut self) {
+        for stream in self.streams.values_mut() {
+            stream.jitter_buffer.clear();
+        }
     }
+}
 
+impl PeerRoomStream {
+    /// Pull a frame for this stream and render it to stereo. Returns
+    /// false when there's nothing buffered yet (caller skips it).
     fn next_spatial_audio(
         &mut self,
+        peer_name: &str,
+        peer_position: Position,
+        peer_volume: f32,
+        peer_muted: bool,
         listener: &Transform,
         cfg: &SpatialConfig,
+        room_type_volume: f32,
         stereo_out: &mut [f32],
     ) -> bool {
-        if self.is_muted {
+        if peer_muted {
             let _ = self.jitter_buffer.pop();
             return false;
         }
@@ -274,28 +326,43 @@ impl PlaybackPeer {
         };
 
         if self.last_distance_log.elapsed() > Duration::from_secs(2) {
-            let distance = listener.position.distance_to(&self.position);
-            let (right_c, up_c, front_c) = listener.relative_position(&self.position);
-            let azimuth_deg = listener.azimuth_to(&self.position).to_degrees();
+            let distance = listener.position.distance_to(&peer_position);
+            let (right_c, up_c, front_c) = listener.relative_position(&peer_position);
+            let azimuth_deg = listener.azimuth_to(&peer_position).to_degrees();
             log::info!(
-                "peer '{}' distance={:.1} listener=({:.1},{:.1},{:.1}) front=({:.2},{:.2},{:.2}) top=({:.2},{:.2},{:.2}) source=({:.1},{:.1},{:.1}) local=(right={:.1},up={:.1},front={:.1}) azimuth={:.0}° min={:.0} max={:.0} mode={:?}",
-                self.player_name,
+                "peer '{}' room_type={:?} distance={:.1} listener=({:.1},{:.1},{:.1}) front=({:.2},{:.2},{:.2}) top=({:.2},{:.2},{:.2}) source=({:.1},{:.1},{:.1}) local=(right={:.1},up={:.1},front={:.1}) azimuth={:.0}° min={:.0} max={:.0} mode={:?} room_gain={:.2}",
+                peer_name,
+                self.room_type,
                 distance,
                 listener.position.x, listener.position.y, listener.position.z,
                 listener.front.x, listener.front.y, listener.front.z,
                 listener.top.x, listener.top.y, listener.top.z,
-                self.position.x, self.position.y, self.position.z,
+                peer_position.x, peer_position.y, peer_position.z,
                 right_c, up_c, front_c,
                 azimuth_deg,
                 cfg.min_distance, cfg.max_distance, cfg.mode,
+                room_type_volume,
             );
             self.last_distance_log = Instant::now();
         }
 
+        // Map rooms keep the spatial pipeline; squad/party play
+        // centered with no distance attenuation. Unknown prefixes (which
+        // the UI rejects but server still forwards if asked) fall back
+        // to the configured spatial mode.
+        let stream_cfg = match self.room_type {
+            Some(RoomType::Map) | None => *cfg,
+            _ => SpatialConfig {
+                mode: SpatialMode::Off,
+                ..*cfg
+            },
+        };
+
         self.spatial
-            .process_frame(&mono, listener, &self.position, cfg, stereo_out);
+            .process_frame(&mono, listener, &peer_position, &stream_cfg, stereo_out);
+        let gain = peer_volume * room_type_volume;
         for sample in stereo_out.iter_mut() {
-            *sample *= self.volume;
+            *sample *= gain;
         }
         true
     }
@@ -308,6 +375,7 @@ struct IncomingPlaybackEngine {
     peer_scratch: Vec<f32>,
     mixer: AudioMixer,
     output_volume: f32,
+    room_type_volumes: RoomTypeVolumes,
     is_deafened: bool,
     frame_duration: Duration,
     target_lead: Duration,
@@ -327,6 +395,7 @@ impl IncomingPlaybackEngine {
             peer_scratch: vec![0.0; FRAME_SIZE * 2],
             mixer: AudioMixer::new(),
             output_volume: 1.0,
+            room_type_volumes: RoomTypeVolumes::default(),
             is_deafened: false,
             frame_duration,
             target_lead: frame_duration * 3,
@@ -351,7 +420,7 @@ impl IncomingPlaybackEngine {
 
     fn clear_peer_buffers(&mut self) {
         for peer in self.peers.values_mut() {
-            peer.clear_buffer();
+            peer.clear_buffers();
         }
     }
 
@@ -391,27 +460,38 @@ impl IncomingPlaybackEngine {
                 self.mixer.set_master_volume(output_volume);
                 self.set_deafened(playback, is_deafened);
             }
+            IncomingAudioCommand::SetRoomTypeVolumes(volumes) => {
+                self.room_type_volumes = volumes;
+            }
             IncomingAudioCommand::UpsertPeer {
                 peer_id,
                 player_name,
             } => {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.player_name = player_name;
-                } else if let Ok(peer) = PlaybackPeer::new(peer_id.clone(), player_name) {
+                } else {
+                    let peer = PlaybackPeer::new(peer_id.clone(), player_name);
                     self.peers.insert(peer_id, peer);
                 }
             }
             IncomingAudioCommand::RemovePeer { peer_id } => {
                 self.peers.remove(&peer_id);
             }
+            IncomingAudioCommand::RemovePeerFromRoom { peer_id, room_id } => {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.streams.remove(&room_id);
+                    if peer.streams.is_empty() {
+                        self.peers.remove(&peer_id);
+                    }
+                }
+            }
             IncomingAudioCommand::SetPeerPosition {
                 peer_id,
                 position,
                 front,
             } => {
-                if let Some(peer) = self.ensure_peer(&peer_id) {
-                    peer.update_position(position, front);
-                }
+                let peer = self.ensure_peer(&peer_id);
+                peer.update_position(position, front);
             }
             IncomingAudioCommand::SetPeerLocalPosition {
                 peer_id,
@@ -421,20 +501,27 @@ impl IncomingPlaybackEngine {
                 let world_position = self
                     .listener_transform
                     .local_offset_to_world(position.x, position.y, position.z);
-                if let Some(peer) = self.ensure_peer(&peer_id) {
-                    peer.update_position(world_position, front);
+                let peer = self.ensure_peer(&peer_id);
+                peer.update_position(world_position, front);
+            }
+            IncomingAudioCommand::PushPeerOpus {
+                peer_id,
+                room_id,
+                data,
+            } => {
+                let peer = self.ensure_peer(&peer_id);
+                if let Err(e) = peer.push_opus(&room_id, &data) {
+                    log::warn!("Failed to decode audio for {}/{}: {}", peer_id, room_id, e);
                 }
             }
-            IncomingAudioCommand::PushPeerOpus { peer_id, data } => {
-                if let Some(peer) = self.ensure_peer(&peer_id) {
-                    if let Err(e) = peer.push_opus(&data) {
-                        log::warn!("Failed to decode audio for {}: {}", peer_id, e);
-                    }
-                }
-            }
-            IncomingAudioCommand::PushPeerPcm { peer_id, data } => {
-                if let Some(peer) = self.ensure_peer(&peer_id) {
-                    peer.push_pcm(data);
+            IncomingAudioCommand::PushPeerPcm {
+                peer_id,
+                room_id,
+                data,
+            } => {
+                let peer = self.ensure_peer(&peer_id);
+                if let Err(e) = peer.push_pcm(&room_id, data) {
+                    log::warn!("Failed to push PCM for {}/{}: {}", peer_id, room_id, e);
                 }
             }
             IncomingAudioCommand::SetPeerMuted { peer_id, muted } => {
@@ -450,19 +537,10 @@ impl IncomingPlaybackEngine {
         }
     }
 
-    fn ensure_peer(&mut self, peer_id: &str) -> Option<&mut PlaybackPeer> {
-        if !self.peers.contains_key(peer_id) {
-            match PlaybackPeer::new(peer_id.to_string(), peer_id.to_string()) {
-                Ok(peer) => {
-                    self.peers.insert(peer_id.to_string(), peer);
-                }
-                Err(e) => {
-                    log::warn!("Failed to create playback peer {}: {}", peer_id, e);
-                    return None;
-                }
-            }
-        }
-        self.peers.get_mut(peer_id)
+    fn ensure_peer(&mut self, peer_id: &str) -> &mut PlaybackPeer {
+        self.peers
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PlaybackPeer::new(peer_id.to_string(), peer_id.to_string()))
     }
 
     fn process(&mut self, playback: &AudioPlayback) {
@@ -502,12 +580,27 @@ impl IncomingPlaybackEngine {
             let mut peer_audio = Vec::new();
 
             for peer in self.peers.values_mut() {
-                if peer.next_spatial_audio(
-                    &self.listener_transform,
-                    &self.spatial_cfg,
-                    &mut self.peer_scratch,
-                ) {
-                    peer_audio.push(self.peer_scratch.clone());
+                let peer_position = peer.position;
+                let peer_volume = peer.volume;
+                let peer_muted = peer.is_muted;
+                let peer_name = peer.player_name.clone();
+                for stream in peer.streams.values_mut() {
+                    let room_gain = stream
+                        .room_type
+                        .map(|t| self.room_type_volumes.get(t))
+                        .unwrap_or(1.0);
+                    if stream.next_spatial_audio(
+                        &peer_name,
+                        peer_position,
+                        peer_volume,
+                        peer_muted,
+                        &self.listener_transform,
+                        &self.spatial_cfg,
+                        room_gain,
+                        &mut self.peer_scratch,
+                    ) {
+                        peer_audio.push(self.peer_scratch.clone());
+                    }
                 }
             }
 

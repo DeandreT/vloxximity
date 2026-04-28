@@ -1,8 +1,14 @@
+pub mod active_speak;
+pub mod group;
 pub mod manager;
 pub mod mixer;
 pub mod peer;
 pub mod persist;
+pub mod room_type;
 
+pub use active_speak::ActiveSpeak;
+pub use group::{GroupKind, GroupMemberEvent, GroupMemberSnapshot, GroupState};
 pub use manager::{VoiceManager, VoiceMode, VoiceSettings, VoiceState, DEFAULT_SERVER_URL};
 pub use mixer::AudioMixer;
 pub use peer::VoicePeer;
+pub use room_type::{RoomType, RoomTypeVolumes};

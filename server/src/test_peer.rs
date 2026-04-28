@@ -180,7 +180,8 @@ async fn supervisor(rooms: Arc<RoomManager>, mode: TestPeerMode) {
 
 fn start_peer(rooms: Arc<RoomManager>, room_id: String, spec: PeerSpec) -> Option<ActivePeer> {
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
-    let peer_id = rooms.register_peer(event_tx);
+    let registered = rooms.register_peer(event_tx);
+    let peer_id = registered.peer_id.clone();
 
     let (stop_tx, stop_rx) = oneshot::channel();
     let peer_id_task = peer_id.clone();
@@ -243,17 +244,21 @@ async fn run_peer(
             _ = audio_ticker.tick() => {}
         }
 
+        // Test peers have no inbound socket; keep their liveness fresh so
+        // the sweeper doesn't flag them as idle.
+        rooms.touch_peer(&peer_id);
+
         let target_pos_opt: Option<Position> = target
             .as_deref()
             .and_then(|id| rooms.get_peer_snapshot(id))
-            .filter(|s| s.room_id.as_deref() == Some(room_id.as_str()))
+            .filter(|s| s.room_ids.contains(room_id.as_str()))
             .map(|s| s.position)
             .or_else(|| {
                 target = rooms.first_other_peer_in(&room_id, &peer_id);
                 target
                     .as_deref()
                     .and_then(|id| rooms.get_peer_snapshot(id))
-                    .filter(|s| s.room_id.as_deref() == Some(room_id.as_str()))
+                    .filter(|s| s.room_ids.contains(room_id.as_str()))
                     .map(|s| s.position)
             });
 
@@ -293,7 +298,7 @@ async fn run_peer(
             // Stamp position before joining so it's on record the moment the
             // room broadcasts PeerJoined.
             rooms.update_position(&peer_id, pos, front);
-            if rooms.join_room(&peer_id, &room_id, &spec.name, None).is_none() {
+            if rooms.join_room(&peer_id, &room_id, &spec.name).is_none() {
                 tracing::warn!("Test peer failed to join room {}", room_id);
                 rooms.unregister_peer(&peer_id);
                 return;
@@ -331,7 +336,7 @@ async fn run_peer(
         }
 
         match encoder.encode_vec(&pcm, OPUS_MAX_PACKET) {
-            Ok(packet) => rooms.broadcast_audio(&peer_id, packet),
+            Ok(packet) => rooms.broadcast_audio(&peer_id, &room_id, packet),
             Err(err) => tracing::warn!("Test peer encode error: {:?}", err),
         }
     }

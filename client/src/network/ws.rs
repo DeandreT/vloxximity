@@ -4,6 +4,7 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -20,7 +21,10 @@ pub struct SignalingClient {
     server_url: String,
     state: Arc<RwLock<ConnectionState>>,
     peer_id: Arc<RwLock<Option<String>>>,
-    current_room: Arc<RwLock<Option<String>>>,
+    /// Rooms the local client is currently joined to. Updated as
+    /// `RoomJoined` / `PeerLeft` (for self) flow through. Used by
+    /// reconnect so every joined room can be re-issued at once.
+    joined_rooms: Arc<RwLock<HashSet<String>>>,
     message_tx: Option<mpsc::UnboundedSender<ClientOutboundMessage>>,
     event_rx: Option<mpsc::UnboundedReceiver<ServerMessage>>,
     event_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
@@ -28,7 +32,7 @@ pub struct SignalingClient {
 
 enum ClientOutboundMessage {
     Text(ClientMessage),
-    Audio(Vec<u8>),
+    Audio { room_id: String, data: Vec<u8> },
 }
 
 impl SignalingClient {
@@ -37,7 +41,7 @@ impl SignalingClient {
             server_url: server_url.to_string(),
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             peer_id: Arc::new(RwLock::new(None)),
-            current_room: Arc::new(RwLock::new(None)),
+            joined_rooms: Arc::new(RwLock::new(HashSet::new())),
             message_tx: None,
             event_rx: None,
             event_tx: None,
@@ -77,7 +81,7 @@ impl SignalingClient {
 
         let state = self.state.clone();
         let peer_id = self.peer_id.clone();
-        let current_room = self.current_room.clone();
+        let joined_rooms_read = self.joined_rooms.clone();
 
         // Spawn write task
         tokio::spawn(async move {
@@ -91,12 +95,9 @@ impl SignalingClient {
                             break;
                         }
                     }
-                    ClientOutboundMessage::Audio(data) => {
-                        if write
-                            .send(Message::Binary(encode_client_audio_frame(&data).into()))
-                            .await
-                            .is_err()
-                        {
+                    ClientOutboundMessage::Audio { room_id, data } => {
+                        let frame = encode_client_audio_frame(&room_id, &data);
+                        if write.send(Message::Binary(frame.into())).await.is_err() {
                             log::warn!("Signaling write task: failed to send audio");
                             break;
                         }
@@ -120,9 +121,9 @@ impl SignalingClient {
                                     log::info!("Received peer ID: {}", id);
                                 }
 
-                                // Handle room joined
+                                // Track joined-room set so reconnect can re-issue them.
                                 if let ServerMessage::RoomJoined { room_id, .. } = &server_msg {
-                                    *current_room.write() = Some(room_id.clone());
+                                    joined_rooms_read.write().insert(room_id.clone());
                                     log::info!("Joined room: {}", room_id);
                                 }
 
@@ -134,8 +135,9 @@ impl SignalingClient {
                         }
                     }
                     Message::Binary(data) => {
-                        if let Some((peer_id, audio)) = decode_server_audio_frame(&data) {
+                        if let Some((peer_id, room_id, audio)) = decode_server_audio_frame(&data) {
                             let _ = evt_tx.send(ServerMessage::PeerAudio {
+                                room_id,
                                 peer_id,
                                 data: audio,
                             });
@@ -163,7 +165,7 @@ impl SignalingClient {
         self.event_tx = None;
         *self.state.write() = ConnectionState::Disconnected;
         *self.peer_id.write() = None;
-        *self.current_room.write() = None;
+        self.joined_rooms.write().clear();
     }
 
     /// Send a message to the server
@@ -193,9 +195,17 @@ impl SignalingClient {
         res
     }
 
-    /// Leave current room
-    pub fn leave_room(&self) -> Result<()> {
-        self.send(ClientMessage::LeaveRoom)
+    /// Leave a single room when `room_id` is `Some`, or every joined room
+    /// when `None` (used at logout / re-auth / disconnect).
+    pub fn leave_room(&self, room_id: Option<&str>) -> Result<()> {
+        if let Some(id) = room_id {
+            self.joined_rooms.write().remove(id);
+        } else {
+            self.joined_rooms.write().clear();
+        }
+        self.send(ClientMessage::LeaveRoom {
+            room_id: room_id.map(str::to_string),
+        })
     }
 
     /// Ask the server to validate an API key without touching room state.
@@ -210,10 +220,18 @@ impl SignalingClient {
         self.send(ClientMessage::UpdatePosition { position, front })
     }
 
-    /// Send audio data as a binary Opus frame.
-    pub fn send_audio(&self, data: &[u8]) -> Result<()> {
+    /// Report the local GW2 group's membership for server-side clustering.
+    pub fn identify_group(&self, members: Vec<String>) -> Result<()> {
+        self.send(ClientMessage::IdentifyGroup { members })
+    }
+
+    /// Send audio data as a binary Opus frame, tagged with the target room.
+    pub fn send_audio(&self, room_id: &str, data: &[u8]) -> Result<()> {
         if let Some(tx) = &self.message_tx {
-            tx.send(ClientOutboundMessage::Audio(data.to_vec()))?;
+            tx.send(ClientOutboundMessage::Audio {
+                room_id: room_id.to_string(),
+                data: data.to_vec(),
+            })?;
         }
         Ok(())
     }
@@ -238,9 +256,9 @@ impl SignalingClient {
         self.peer_id.read().clone()
     }
 
-    /// Get current room
-    pub fn current_room(&self) -> Option<String> {
-        self.current_room.read().clone()
+    /// Snapshot of every room the client is currently joined to.
+    pub fn joined_rooms(&self) -> HashSet<String> {
+        self.joined_rooms.read().clone()
     }
 
     /// Check if connected

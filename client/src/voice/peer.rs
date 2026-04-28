@@ -3,6 +3,7 @@
 use crate::position::Position;
 use anyhow::Result;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 const SPEAKING_TIMEOUT: Duration = Duration::from_millis(300);
@@ -14,6 +15,10 @@ pub struct VoicePeer {
     /// Server-validated GW2 account handle, when the peer supplied a valid
     /// API key.
     pub account_name: Option<String>,
+    /// Rooms the local client currently shares with this peer. The peer is
+    /// dropped from the local map when this becomes empty (last shared
+    /// room ended).
+    pub room_ids: HashSet<String>,
     pub position: Position,
     pub front: Position,
     pub volume: f32,
@@ -28,6 +33,7 @@ impl VoicePeer {
             peer_id,
             player_name,
             account_name,
+            room_ids: HashSet::new(),
             position: Position::default(),
             front: Position::new(0.0, 0.0, 1.0),
             volume: 1.0,

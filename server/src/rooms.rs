@@ -2,10 +2,13 @@
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use uuid::Uuid;
+
+use crate::limits::MAX_CONNECTIONS_PER_ACCOUNT;
 
 /// Position in 3D space
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -21,31 +24,62 @@ pub struct Peer {
     pub id: String,
     pub player_name: String,
     pub account_name: Option<String>,
-    pub room_id: Option<String>,
+    /// All rooms the peer is currently a member of. A peer may be in many
+    /// rooms simultaneously (e.g. a `map:` room plus a `squad:` room) and
+    /// receives audio from every one of them.
+    pub room_ids: HashSet<String>,
     pub position: Position,
     pub front: Position,
     pub last_update: Instant,
     pub tx: broadcast::Sender<RoomEvent>,
+    /// Timestamp of the most recent inbound WS message of any kind. Used by
+    /// the dead-connection sweeper. The session task is the only writer; the
+    /// sweeper is the only reader, so the mutex is uncontended in practice.
+    pub last_seen: Arc<Mutex<Instant>>,
+    /// Sweeper signals here to terminate the connection. The session loop
+    /// awaits `kick.notified()` alongside the WS receiver.
+    pub kick: Arc<Notify>,
+}
+
+/// Handles handed back from `register_peer` so the session task can update
+/// liveness and watch for kicks without going through the DashMap on the hot
+/// path.
+#[derive(Clone)]
+pub struct RegisteredPeer {
+    pub peer_id: String,
+    pub last_seen: Arc<Mutex<Instant>>,
+    pub kick: Arc<Notify>,
+}
+
+#[derive(Debug)]
+pub struct AccountCapExceeded;
+
+#[derive(Debug, Default)]
+struct AccountState {
+    peer_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PeerSnapshot {
-    pub room_id: Option<String>,
+    pub room_ids: HashSet<String>,
     pub position: Position,
     pub front: Position,
 }
 
 impl Peer {
     pub fn new(tx: broadcast::Sender<RoomEvent>) -> Self {
+        let now = Instant::now();
         Self {
             id: Uuid::new_v4().to_string(),
             player_name: String::new(),
             account_name: None,
-            room_id: None,
+            room_ids: HashSet::new(),
             position: Position::default(),
             front: Position::new(0.0, 0.0, 1.0),
-            last_update: Instant::now(),
+            last_update: now,
             tx,
+            last_seen: Arc::new(Mutex::new(now)),
+            kick: Arc::new(Notify::new()),
         }
     }
 }
@@ -57,16 +91,21 @@ impl Position {
 }
 
 /// Events broadcast within a room. The `Peer*` prefix is deliberate — it
-/// names the subject (a peer, not the room itself).
+/// names the subject (a peer, not the room itself). Membership-scoped events
+/// (`PeerJoined`, `PeerLeft`, `PeerAudio`) carry the `room_id` so a listener
+/// in many rooms can route the event correctly. `PeerPosition` is global —
+/// world position is per-peer, not per-room.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub enum RoomEvent {
     PeerJoined {
+        room_id: String,
         peer_id: String,
         player_name: String,
         account_name: Option<String>,
     },
     PeerLeft {
+        room_id: String,
         peer_id: String,
     },
     PeerPosition {
@@ -75,6 +114,7 @@ pub enum RoomEvent {
         front: Position,
     },
     PeerAudio {
+        room_id: String,
         peer_id: String,
         data: Vec<u8>,
     },
@@ -140,6 +180,10 @@ impl Room {
 pub struct RoomManager {
     rooms: DashMap<String, Arc<Room>>,
     peers: DashMap<String, Peer>,
+    /// Index from GW2 account name to the peer ids currently bound to it.
+    /// Maintained by `try_set_account_name` and `unregister_peer`. Used to
+    /// enforce the per-account connection cap.
+    accounts: DashMap<String, AccountState>,
 }
 
 impl RoomManager {
@@ -147,81 +191,103 @@ impl RoomManager {
         Self {
             rooms: DashMap::new(),
             peers: DashMap::new(),
+            accounts: DashMap::new(),
         }
     }
 
-    /// Register a new peer
-    pub fn register_peer(&self, tx: broadcast::Sender<RoomEvent>) -> String {
+    /// Register a new peer. Returns handles the session task uses for the
+    /// hot path (liveness updates, kick signalling).
+    pub fn register_peer(&self, tx: broadcast::Sender<RoomEvent>) -> RegisteredPeer {
         let peer = Peer::new(tx);
-        let peer_id = peer.id.clone();
-        self.peers.insert(peer_id.clone(), peer);
-        tracing::info!("Peer registered: {}", peer_id);
-        peer_id
+        let registered = RegisteredPeer {
+            peer_id: peer.id.clone(),
+            last_seen: peer.last_seen.clone(),
+            kick: peer.kick.clone(),
+        };
+        self.peers.insert(peer.id.clone(), peer);
+        tracing::info!("Peer registered: {}", registered.peer_id);
+        registered
     }
 
     /// Unregister a peer
     pub fn unregister_peer(&self, peer_id: &str) {
         if let Some((_, peer)) = self.peers.remove(peer_id) {
-            if let Some(room_id) = &peer.room_id {
+            for room_id in &peer.room_ids {
                 self.leave_room(peer_id, room_id);
+            }
+            if let Some(account) = &peer.account_name {
+                self.unbind_account(account, peer_id);
             }
         }
         tracing::info!("Peer unregistered: {}", peer_id);
     }
 
-    /// Join a room
+    /// Drop `peer_id` from `account_name`'s bound list, removing the account
+    /// entry entirely if it would become empty.
+    fn unbind_account(&self, account_name: &str, peer_id: &str) {
+        let now_empty = if let Some(mut entry) = self.accounts.get_mut(account_name) {
+            entry.peer_ids.retain(|id| id != peer_id);
+            entry.peer_ids.is_empty()
+        } else {
+            return;
+        };
+        if now_empty {
+            self.accounts.remove(account_name);
+        }
+    }
+
+    /// Add `peer_id` to `room_id`. Joins are *additive*: a peer may be in
+    /// many rooms simultaneously. Re-joining a room the peer is already in
+    /// is a no-op (no PeerJoined re-broadcast); the current peer list is
+    /// still returned so the client can refresh state.
+    ///
+    /// Uses whatever account_name is already bound on the peer (set via
+    /// `try_set_account_name`).
     pub fn join_room(
         &self,
         peer_id: &str,
         room_id: &str,
         player_name: &str,
-        account_name: Option<String>,
     ) -> Option<Vec<PeerInfo>> {
-        // Update peer info
-        let mut peer = self.peers.get_mut(peer_id)?;
-        peer.player_name = player_name.to_string();
-        peer.account_name = account_name.clone();
-
-        // Leave current room if any
-        if let Some(old_room_id) = peer.room_id.take() {
-            drop(peer); // Release lock
-            self.leave_room(peer_id, &old_room_id);
-            peer = self.peers.get_mut(peer_id)?;
+        let was_already_member;
+        let account_name;
+        {
+            let mut peer = self.peers.get_mut(peer_id)?;
+            peer.player_name = player_name.to_string();
+            account_name = peer.account_name.clone();
+            was_already_member = !peer.room_ids.insert(room_id.to_string());
         }
 
-        peer.room_id = Some(room_id.to_string());
-
-        // Get or create room
         let room = self
             .rooms
             .entry(room_id.to_string())
             .or_insert_with(|| Arc::new(Room::new()))
             .clone();
 
-        // Get existing peers before adding new one
         let existing_peers = room.get_peers();
 
-        // Add peer to room
-        room.add_peer(&peer);
+        if was_already_member {
+            return Some(existing_peers);
+        }
 
-        // Release the per-peer write lock before iterating `self.peers`, or
-        // DashMap will deadlock when `iter()` tries to read-lock the same shard.
-        drop(peer);
+        // Re-borrow the peer to feed up-to-date info into the room's listing.
+        if let Some(peer) = self.peers.get(peer_id) {
+            room.add_peer(&peer);
+        } else {
+            // Peer vanished between the get_mut and now — bail.
+            return None;
+        }
 
-        // Notify other peers
         let event = RoomEvent::PeerJoined {
+            room_id: room_id.to_string(),
             peer_id: peer_id.to_string(),
             player_name: player_name.to_string(),
             account_name,
         };
 
         for other_peer in self.peers.iter() {
-            if other_peer.id != peer_id {
-                if let Some(ref other_room) = other_peer.room_id {
-                    if other_room == room_id {
-                        let _ = other_peer.tx.send(event.clone());
-                    }
-                }
+            if other_peer.id != peer_id && other_peer.room_ids.contains(room_id) {
+                let _ = other_peer.tx.send(event.clone());
             }
         }
 
@@ -229,28 +295,34 @@ impl RoomManager {
         Some(existing_peers)
     }
 
-    /// Leave a room
+    /// Leave a single room. Idempotent: a no-op if the peer wasn't in it.
     pub fn leave_room(&self, peer_id: &str, room_id: &str) {
-        // Remove from room
+        // Drop the membership flag first. If the peer is gone (unregister
+        // path already removed it), proceed with room-side cleanup anyway —
+        // the peer may still be listed in `room.peers` and other peers still
+        // need a PeerLeft.
+        let was_member = match self.peers.get_mut(peer_id) {
+            Some(mut peer) => peer.room_ids.remove(room_id),
+            None => true,
+        };
+
+        if !was_member {
+            return;
+        }
+
         if let Some(room) = self.rooms.get(room_id) {
             room.remove_peer(peer_id);
 
-            // Notify other peers
             let event = RoomEvent::PeerLeft {
+                room_id: room_id.to_string(),
                 peer_id: peer_id.to_string(),
             };
-
             for other_peer in self.peers.iter() {
-                if other_peer.id != peer_id {
-                    if let Some(ref other_room) = other_peer.room_id {
-                        if other_room == room_id {
-                            let _ = other_peer.tx.send(event.clone());
-                        }
-                    }
+                if other_peer.id != peer_id && other_peer.room_ids.contains(room_id) {
+                    let _ = other_peer.tx.send(event.clone());
                 }
             }
 
-            // Clean up empty rooms
             if room.is_empty() {
                 drop(room);
                 self.rooms.remove(room_id);
@@ -258,84 +330,164 @@ impl RoomManager {
             }
         }
 
-        // Update peer
-        if let Some(mut peer) = self.peers.get_mut(peer_id) {
-            peer.room_id = None;
-        }
-
         tracing::info!("Peer {} left room {}", peer_id, room_id);
     }
 
-    pub fn set_account_name(&self, peer_id: &str, account_name: Option<String>) {
-        if let Some(mut peer) = self.peers.get_mut(peer_id) {
+    /// Leave every room the peer is currently in. Used at disconnect or when
+    /// the client explicitly sends `LeaveRoom { room_id: None }`.
+    pub fn leave_all_rooms(&self, peer_id: &str) {
+        let rooms: Vec<String> = self
+            .peers
+            .get(peer_id)
+            .map(|p| p.room_ids.iter().cloned().collect())
+            .unwrap_or_default();
+        for room_id in rooms {
+            self.leave_room(peer_id, &room_id);
+        }
+    }
+
+    /// Bind (or clear) a peer's account name, enforcing the per-account
+    /// connection cap.
+    ///
+    /// Returns `Err(AccountCapExceeded)` only when binding to a *new* account
+    /// would push that account over `MAX_CONNECTIONS_PER_ACCOUNT`. Re-binding
+    /// to the same account is a no-op and always succeeds; clearing
+    /// (`account_name = None`) always succeeds.
+    pub fn try_set_account_name(
+        &self,
+        peer_id: &str,
+        account_name: Option<String>,
+    ) -> Result<(), AccountCapExceeded> {
+        let current = self.peers.get(peer_id).and_then(|p| p.account_name.clone());
+
+        if current == account_name {
+            return Ok(());
+        }
+
+        // Reserve a slot in the new account first (so on cap-exceeded we
+        // don't disturb the old binding).
+        if let Some(ref new_name) = account_name {
+            let mut entry = self.accounts.entry(new_name.clone()).or_default();
+            if !entry.peer_ids.iter().any(|id| id == peer_id)
+                && entry.peer_ids.len() >= MAX_CONNECTIONS_PER_ACCOUNT
+            {
+                return Err(AccountCapExceeded);
+            }
+            if !entry.peer_ids.iter().any(|id| id == peer_id) {
+                entry.peer_ids.push(peer_id.to_string());
+            }
+        }
+
+        if let Some(old_name) = current {
+            self.unbind_account(&old_name, peer_id);
+        }
+
+        let room_ids: Vec<String> = if let Some(mut peer) = self.peers.get_mut(peer_id) {
             peer.account_name = account_name.clone();
-            if let Some(ref room_id) = peer.room_id {
-                if let Some(room) = self.rooms.get(room_id) {
-                    if let Some(mut info) = room.peers.get_mut(peer_id) {
-                        info.account_name = account_name;
-                    }
+            peer.room_ids.iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
+        for room_id in &room_ids {
+            if let Some(room) = self.rooms.get(room_id) {
+                if let Some(mut info) = room.peers.get_mut(peer_id) {
+                    info.account_name = account_name.clone();
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Number of WS connections currently bound to `account_name`.
+    pub fn account_connection_count(&self, account_name: &str) -> usize {
+        self.accounts
+            .get(account_name)
+            .map(|s| s.peer_ids.len())
+            .unwrap_or(0)
+    }
+
+    /// Iterate over `(peer_id, last_seen, kick)` for every registered peer.
+    /// Used by the dead-connection sweeper.
+    pub fn peer_liveness_handles(&self) -> Vec<(String, Arc<Mutex<Instant>>, Arc<Notify>)> {
+        self.peers
+            .iter()
+            .map(|p| (p.id.clone(), p.last_seen.clone(), p.kick.clone()))
+            .collect()
+    }
+
+    /// Refresh a peer's liveness timestamp without going through a WS
+    /// message. Used by synthetic test peers that don't have an inbound
+    /// socket but should not be culled by the sweeper.
+    pub fn touch_peer(&self, peer_id: &str) {
+        if let Some(peer) = self.peers.get(peer_id) {
+            if let Ok(mut guard) = peer.last_seen.lock() {
+                *guard = Instant::now();
             }
         }
     }
 
-    /// Update peer position
+    /// Update peer position. Position is *peer-global* — the same world
+    /// coordinates apply across every room the peer is in. Recipients are
+    /// the union of all peers who share at least one room with the sender,
+    /// deduplicated automatically because each peer has a single tx channel.
     pub fn update_position(&self, peer_id: &str, position: Position, front: Position) {
-        if let Some(mut peer) = self.peers.get_mut(peer_id) {
+        let sender_rooms: HashSet<String> = {
+            let Some(mut peer) = self.peers.get_mut(peer_id) else { return };
             peer.position = position;
             peer.front = front;
             peer.last_update = Instant::now();
+            peer.room_ids.clone()
+        };
 
-            if let Some(ref room_id) = peer.room_id {
-                // Update in room
-                if let Some(room) = self.rooms.get(room_id) {
-                    room.update_position(peer_id, position, front);
-                }
+        if sender_rooms.is_empty() {
+            return;
+        }
 
-                let room_id = room_id.clone();
-                drop(peer);
-
-                // Broadcast to other peers in room
-                let event = RoomEvent::PeerPosition {
-                    peer_id: peer_id.to_string(),
-                    position,
-                    front,
-                };
-
-                for other_peer in self.peers.iter() {
-                    if other_peer.id != peer_id {
-                        if let Some(ref other_room) = other_peer.room_id {
-                            if other_room == &room_id {
-                                let _ = other_peer.tx.send(event.clone());
-                            }
-                        }
-                    }
-                }
+        for room_id in &sender_rooms {
+            if let Some(room) = self.rooms.get(room_id) {
+                room.update_position(peer_id, position, front);
             }
+        }
+
+        let event = RoomEvent::PeerPosition {
+            peer_id: peer_id.to_string(),
+            position,
+            front,
+        };
+
+        for other_peer in self.peers.iter() {
+            if other_peer.id == peer_id {
+                continue;
+            }
+            if other_peer.room_ids.is_disjoint(&sender_rooms) {
+                continue;
+            }
+            let _ = other_peer.tx.send(event.clone());
         }
     }
 
-    /// Broadcast audio to all other peers in the same room.
-    pub fn broadcast_audio(&self, peer_id: &str, data: Vec<u8>) {
-        if let Some(peer) = self.peers.get(peer_id) {
-            if let Some(ref room_id) = peer.room_id {
-                let room_id = room_id.clone();
-                drop(peer);
+    /// Broadcast audio tagged to a specific room. Drops the frame if the
+    /// sender isn't a member of that room (defensive against malicious
+    /// clients trying to inject audio into rooms they haven't joined).
+    pub fn broadcast_audio(&self, peer_id: &str, room_id: &str, data: Vec<u8>) {
+        let sender_in_room = self
+            .peers
+            .get(peer_id)
+            .map(|p| p.room_ids.contains(room_id))
+            .unwrap_or(false);
+        if !sender_in_room {
+            return;
+        }
 
-                let event = RoomEvent::PeerAudio {
-                    peer_id: peer_id.to_string(),
-                    data,
-                };
+        let event = RoomEvent::PeerAudio {
+            room_id: room_id.to_string(),
+            peer_id: peer_id.to_string(),
+            data,
+        };
 
-                for other_peer in self.peers.iter() {
-                    if other_peer.id != peer_id {
-                        if let Some(ref other_room) = other_peer.room_id {
-                            if other_room == &room_id {
-                                let _ = other_peer.tx.send(event.clone());
-                            }
-                        }
-                    }
-                }
+        for other_peer in self.peers.iter() {
+            if other_peer.id != peer_id && other_peer.room_ids.contains(room_id) {
+                let _ = other_peer.tx.send(event.clone());
             }
         }
     }
@@ -350,15 +502,25 @@ impl RoomManager {
         self.peers.len()
     }
 
-    /// Get peer's current room
-    pub fn get_peer_room(&self, peer_id: &str) -> Option<String> {
-        self.peers.get(peer_id)?.room_id.clone()
+    /// Get the set of rooms a peer is currently in.
+    pub fn get_peer_rooms(&self, peer_id: &str) -> HashSet<String> {
+        self.peers
+            .get(peer_id)
+            .map(|p| p.room_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get the GW2 account name bound to `peer_id`, if any. Used by the
+    /// `IdentifyGroup` handler to verify the sender is in their own
+    /// reported member list.
+    pub fn peer_account_name(&self, peer_id: &str) -> Option<String> {
+        self.peers.get(peer_id)?.account_name.clone()
     }
 
     pub fn get_peer_snapshot(&self, peer_id: &str) -> Option<PeerSnapshot> {
         let peer = self.peers.get(peer_id)?;
         Some(PeerSnapshot {
-            room_id: peer.room_id.clone(),
+            room_ids: peer.room_ids.clone(),
             position: peer.position,
             front: peer.front,
         })
@@ -390,5 +552,262 @@ impl RoomManager {
 impl Default for RoomManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    fn fresh_peer(rooms: &RoomManager) -> RegisteredPeer {
+        let (tx, _rx) = broadcast::channel(8);
+        rooms.register_peer(tx)
+    }
+
+    #[test]
+    fn account_cap_rejects_over_limit() {
+        let rooms = RoomManager::new();
+        let mut bound = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_ACCOUNT {
+            let p = fresh_peer(&rooms);
+            rooms
+                .try_set_account_name(&p.peer_id, Some("Acct.1234".to_string()))
+                .expect("under-cap binds succeed");
+            bound.push(p);
+        }
+        assert_eq!(
+            rooms.account_connection_count("Acct.1234"),
+            MAX_CONNECTIONS_PER_ACCOUNT
+        );
+
+        let extra = fresh_peer(&rooms);
+        let err = rooms
+            .try_set_account_name(&extra.peer_id, Some("Acct.1234".to_string()))
+            .unwrap_err();
+        let _ = err; // AccountCapExceeded — type is the assertion.
+        assert_eq!(
+            rooms.account_connection_count("Acct.1234"),
+            MAX_CONNECTIONS_PER_ACCOUNT,
+            "rejected bind must not occupy a slot"
+        );
+    }
+
+    #[test]
+    fn unregister_releases_account_slot() {
+        let rooms = RoomManager::new();
+        let first = fresh_peer(&rooms);
+        rooms
+            .try_set_account_name(&first.peer_id, Some("Acct.1234".to_string()))
+            .unwrap();
+        rooms.unregister_peer(&first.peer_id);
+        assert_eq!(rooms.account_connection_count("Acct.1234"), 0);
+
+        // A new peer can now bind to the same account.
+        let second = fresh_peer(&rooms);
+        rooms
+            .try_set_account_name(&second.peer_id, Some("Acct.1234".to_string()))
+            .expect("slot freed by unregister");
+    }
+
+    #[test]
+    fn rebinding_same_account_is_noop() {
+        let rooms = RoomManager::new();
+        let p = fresh_peer(&rooms);
+        rooms
+            .try_set_account_name(&p.peer_id, Some("Acct.1234".to_string()))
+            .unwrap();
+        rooms
+            .try_set_account_name(&p.peer_id, Some("Acct.1234".to_string()))
+            .expect("re-bind to same account is a no-op");
+        assert_eq!(rooms.account_connection_count("Acct.1234"), 1);
+    }
+
+    #[test]
+    fn switching_accounts_moves_slot() {
+        let rooms = RoomManager::new();
+        let p = fresh_peer(&rooms);
+        rooms
+            .try_set_account_name(&p.peer_id, Some("Old.1111".to_string()))
+            .unwrap();
+        rooms
+            .try_set_account_name(&p.peer_id, Some("New.2222".to_string()))
+            .unwrap();
+        assert_eq!(rooms.account_connection_count("Old.1111"), 0);
+        assert_eq!(rooms.account_connection_count("New.2222"), 1);
+    }
+
+    #[test]
+    fn clearing_account_releases_slot() {
+        let rooms = RoomManager::new();
+        let p = fresh_peer(&rooms);
+        rooms
+            .try_set_account_name(&p.peer_id, Some("Acct.1234".to_string()))
+            .unwrap();
+        rooms.try_set_account_name(&p.peer_id, None).unwrap();
+        assert_eq!(rooms.account_connection_count("Acct.1234"), 0);
+    }
+
+    fn drain_events(rx: &mut broadcast::Receiver<RoomEvent>) -> Vec<RoomEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn peer_can_join_multiple_rooms() {
+        let rooms = RoomManager::new();
+        let (tx, _rx) = broadcast::channel(8);
+        let p = rooms.register_peer(tx);
+
+        rooms.join_room(&p.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&p.peer_id, "squad:B", "Alice").unwrap();
+
+        let in_rooms = rooms.get_peer_rooms(&p.peer_id);
+        assert!(in_rooms.contains("map:A"));
+        assert!(in_rooms.contains("squad:B"));
+        assert_eq!(in_rooms.len(), 2);
+    }
+
+    #[test]
+    fn rejoining_same_room_is_idempotent() {
+        let rooms = RoomManager::new();
+        let (tx, mut rx) = broadcast::channel(16);
+        let alice = rooms.register_peer(tx);
+        let (tx2, mut rx2) = broadcast::channel(16);
+        let bob = rooms.register_peer(tx2);
+
+        rooms.join_room(&alice.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&bob.peer_id, "map:A", "Bob").unwrap();
+        // drain
+        let _ = drain_events(&mut rx);
+        let _ = drain_events(&mut rx2);
+
+        // Alice re-joins.
+        rooms.join_room(&alice.peer_id, "map:A", "Alice").unwrap();
+
+        // Bob must NOT see another PeerJoined event for Alice.
+        let evs = drain_events(&mut rx2);
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                RoomEvent::PeerJoined { peer_id, .. } if peer_id == &alice.peer_id
+            )),
+            "rejoin should not re-broadcast PeerJoined: got {:?}",
+            evs
+        );
+    }
+
+    #[test]
+    fn audio_only_fans_out_to_target_room() {
+        let rooms = RoomManager::new();
+        let (atx, _arx) = broadcast::channel(16);
+        let alice = rooms.register_peer(atx);
+        let (btx, mut brx) = broadcast::channel(16);
+        let bob = rooms.register_peer(btx);
+        let (ctx, mut crx) = broadcast::channel(16);
+        let carol = rooms.register_peer(ctx);
+
+        // Alice in {map:A, squad:B}; Bob in {map:A}; Carol in {squad:B}.
+        rooms.join_room(&alice.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&alice.peer_id, "squad:B", "Alice").unwrap();
+        rooms.join_room(&bob.peer_id, "map:A", "Bob").unwrap();
+        rooms.join_room(&carol.peer_id, "squad:B", "Carol").unwrap();
+        let _ = drain_events(&mut brx);
+        let _ = drain_events(&mut crx);
+
+        // Alice speaks into map:A only.
+        rooms.broadcast_audio(&alice.peer_id, "map:A", b"audio".to_vec());
+
+        let bob_evs = drain_events(&mut brx);
+        let carol_evs = drain_events(&mut crx);
+        assert!(bob_evs.iter().any(|e| matches!(
+            e,
+            RoomEvent::PeerAudio { room_id, .. } if room_id == "map:A"
+        )));
+        assert!(
+            !carol_evs.iter().any(|e| matches!(e, RoomEvent::PeerAudio { .. })),
+            "carol is in squad:B only and must not receive map:A audio"
+        );
+    }
+
+    #[test]
+    fn audio_dropped_if_sender_not_in_target_room() {
+        let rooms = RoomManager::new();
+        let (atx, _arx) = broadcast::channel(16);
+        let alice = rooms.register_peer(atx);
+        let (btx, mut brx) = broadcast::channel(16);
+        let bob = rooms.register_peer(btx);
+
+        rooms.join_room(&alice.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&bob.peer_id, "squad:B", "Bob").unwrap();
+        let _ = drain_events(&mut brx);
+
+        // Alice tries to inject into squad:B (which she didn't join).
+        rooms.broadcast_audio(&alice.peer_id, "squad:B", b"audio".to_vec());
+        let evs = drain_events(&mut brx);
+        assert!(
+            !evs.iter().any(|e| matches!(e, RoomEvent::PeerAudio { .. })),
+            "audio targeted at unjoined room must be dropped"
+        );
+    }
+
+    #[test]
+    fn position_dedup_across_shared_rooms() {
+        let rooms = RoomManager::new();
+        let (atx, _arx) = broadcast::channel(16);
+        let alice = rooms.register_peer(atx);
+        let (btx, mut brx) = broadcast::channel(16);
+        let bob = rooms.register_peer(btx);
+
+        // Both Alice and Bob are in two shared rooms.
+        rooms.join_room(&alice.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&alice.peer_id, "squad:B", "Alice").unwrap();
+        rooms.join_room(&bob.peer_id, "map:A", "Bob").unwrap();
+        rooms.join_room(&bob.peer_id, "squad:B", "Bob").unwrap();
+        let _ = drain_events(&mut brx);
+
+        rooms.update_position(
+            &alice.peer_id,
+            Position::new(1.0, 2.0, 3.0),
+            Position::new(0.0, 0.0, 1.0),
+        );
+
+        let position_count = drain_events(&mut brx)
+            .into_iter()
+            .filter(|e| matches!(e, RoomEvent::PeerPosition { .. }))
+            .count();
+        assert_eq!(position_count, 1, "Bob should receive exactly one position update");
+    }
+
+    #[test]
+    fn leave_room_specific_id() {
+        let rooms = RoomManager::new();
+        let (tx, _rx) = broadcast::channel(8);
+        let p = rooms.register_peer(tx);
+
+        rooms.join_room(&p.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&p.peer_id, "squad:B", "Alice").unwrap();
+
+        rooms.leave_room(&p.peer_id, "map:A");
+        let in_rooms = rooms.get_peer_rooms(&p.peer_id);
+        assert!(!in_rooms.contains("map:A"));
+        assert!(in_rooms.contains("squad:B"));
+    }
+
+    #[test]
+    fn leave_all_rooms_clears_membership() {
+        let rooms = RoomManager::new();
+        let (tx, _rx) = broadcast::channel(8);
+        let p = rooms.register_peer(tx);
+
+        rooms.join_room(&p.peer_id, "map:A", "Alice").unwrap();
+        rooms.join_room(&p.peer_id, "squad:B", "Alice").unwrap();
+        rooms.leave_all_rooms(&p.peer_id);
+
+        assert!(rooms.get_peer_rooms(&p.peer_id).is_empty());
+        assert_eq!(rooms.room_count(), 0, "rooms should clean up when empty");
     }
 }

@@ -1,15 +1,20 @@
 //! Per-peer WebSocket session: lifecycle, dispatch, validation, and rate
 //! limiting. Wire types and frame codec live in `protocol`.
 
+use std::time::{Duration, Instant};
+
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 
+use std::collections::HashSet;
+
+use crate::limits::MAX_GROUP_REPORT_MEMBERS;
 use crate::protocol::{
     decode_client_audio_frame, encode_server_audio_frame, ClientMessage, PeerInfo, ServerMessage,
 };
 use crate::rate_limit::PeerRateLimits;
-use crate::rooms::RoomEvent;
+use crate::rooms::{AccountCapExceeded, RoomEvent};
 use crate::AppState;
 
 /// Length caps on string fields. Enforced before any DB / API work to keep
@@ -17,6 +22,9 @@ use crate::AppState;
 const MAX_ROOM_ID_LEN: usize = 64;
 const MAX_PLAYER_NAME_LEN: usize = 64;
 const MAX_API_KEY_LEN: usize = 256;
+/// Cap on each `members` entry length in `IdentifyGroup`. GW2 account
+/// names are at most ~32 chars in practice; mirror the room-id cap.
+const MAX_ACCOUNT_NAME_LEN: usize = 64;
 
 enum OutgoingWsMessage {
     Text(ServerMessage),
@@ -34,7 +42,10 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
     let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // Register peer
-    let peer_id = state.rooms.register_peer(room_tx);
+    let registered = state.rooms.register_peer(room_tx);
+    let peer_id = registered.peer_id.clone();
+    let last_seen = registered.last_seen.clone();
+    let kick = registered.kick.clone();
 
     // Send welcome message
     let welcome = ServerMessage::Welcome {
@@ -94,49 +105,69 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
     let direct_tx_in = direct_tx.clone();
     let mut rates = PeerRateLimits::new();
 
-    while let Some(Ok(msg)) = ws_receiver.next().await {
-        match msg {
-            Message::Text(text) => {
-                let client_msg = match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to parse client message from {}: err={}",
-                            peer_id_in, err
-                        );
-                        continue;
-                    }
-                };
-                if !validate_message_lengths(&peer_id_in, &client_msg) {
-                    continue;
-                }
-                if !apply_rate_limit(&peer_id_in, &client_msg, &mut rates) {
-                    if rates.record_overage() {
-                        tracing::warn!(
-                            "Disconnecting {} after repeated rate-limit hits",
-                            peer_id_in
-                        );
-                        break;
-                    }
-                    continue;
-                }
-                handle_client_message(&peer_id_in, client_msg, &state_in, &direct_tx_in).await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = kick.notified() => {
+                let _ = direct_tx_in.send(ServerMessage::Kicked {
+                    reason: "idle timeout".to_string(),
+                });
+                // Brief pause so the writer task can flush the Kicked frame
+                // before we drop the socket.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                break;
             }
-            Message::Binary(data) => {
-                if !rates.audio.try_take() {
-                    if rates.record_overage() {
-                        tracing::warn!(
-                            "Disconnecting {} after repeated audio rate-limit hits",
-                            peer_id_in
-                        );
-                        break;
-                    }
-                    continue;
+            maybe_msg = ws_receiver.next() => {
+                let Some(Ok(msg)) = maybe_msg else { break };
+                // Refresh liveness on *any* inbound frame, before parsing or
+                // rate-limiting, so even malformed traffic counts as "alive."
+                if let Ok(mut guard) = last_seen.lock() {
+                    *guard = Instant::now();
                 }
-                handle_client_binary_message(&peer_id_in, &data, &state_in).await;
+                match msg {
+                    Message::Text(text) => {
+                        let client_msg = match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(m) => m,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to parse client message from {}: err={}",
+                                    peer_id_in, err
+                                );
+                                continue;
+                            }
+                        };
+                        if !validate_message_lengths(&peer_id_in, &client_msg) {
+                            continue;
+                        }
+                        if !apply_rate_limit(&peer_id_in, &client_msg, &mut rates) {
+                            if rates.record_overage() {
+                                tracing::warn!(
+                                    "Disconnecting {} after repeated rate-limit hits",
+                                    peer_id_in
+                                );
+                                break;
+                            }
+                            continue;
+                        }
+                        handle_client_message(&peer_id_in, client_msg, &state_in, &direct_tx_in).await;
+                    }
+                    Message::Binary(data) => {
+                        if !rates.audio.try_take() {
+                            if rates.record_overage() {
+                                tracing::warn!(
+                                    "Disconnecting {} after repeated audio rate-limit hits",
+                                    peer_id_in
+                                );
+                                break;
+                            }
+                            continue;
+                        }
+                        handle_client_binary_message(&peer_id_in, &data, &state_in).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
@@ -149,11 +180,12 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Convert room event to server message, filtering by peer
 fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<OutgoingWsMessage> {
     match event {
-        RoomEvent::PeerJoined { peer_id, player_name, account_name } => {
+        RoomEvent::PeerJoined { room_id, peer_id, player_name, account_name } => {
             if peer_id == self_peer_id {
                 return None;
             }
             Some(OutgoingWsMessage::Text(ServerMessage::PeerJoined {
+                room_id,
                 peer: PeerInfo {
                     peer_id,
                     player_name,
@@ -163,11 +195,11 @@ fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<Outgoin
                 },
             }))
         }
-        RoomEvent::PeerLeft { peer_id } => {
+        RoomEvent::PeerLeft { room_id, peer_id } => {
             if peer_id == self_peer_id {
                 return None;
             }
-            Some(OutgoingWsMessage::Text(ServerMessage::PeerLeft { peer_id }))
+            Some(OutgoingWsMessage::Text(ServerMessage::PeerLeft { room_id, peer_id }))
         }
         RoomEvent::PeerPosition { peer_id, position, front } => {
             if peer_id == self_peer_id {
@@ -175,18 +207,20 @@ fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<Outgoin
             }
             Some(OutgoingWsMessage::Text(ServerMessage::PeerPosition { peer_id, position, front }))
         }
-        RoomEvent::PeerAudio { peer_id, data } => {
+        RoomEvent::PeerAudio { room_id, peer_id, data } => {
             if peer_id == self_peer_id {
                 return None;
             }
-            Some(OutgoingWsMessage::Binary(encode_server_audio_frame(&peer_id, &data)))
+            Some(OutgoingWsMessage::Binary(encode_server_audio_frame(&peer_id, &room_id, &data)))
         }
     }
 }
 
 async fn handle_client_binary_message(peer_id: &str, data: &[u8], state: &AppState) {
-    if let Some(audio) = decode_client_audio_frame(data) {
-        state.rooms.broadcast_audio(peer_id, audio.to_vec());
+    if let Some((room_id, audio)) = decode_client_audio_frame(data) {
+        state
+            .rooms
+            .broadcast_audio(peer_id, room_id, audio.to_vec());
     } else {
         tracing::warn!("Invalid binary frame from {}", peer_id);
     }
@@ -230,13 +264,28 @@ async fn handle_client_message(
                     peer_id, room_id, reason
                 );
                 let _ = direct_tx.send(ServerMessage::JoinRejected {
+                    room_id: room_id.clone(),
                     reason: reason.to_string(),
                 });
                 return;
             };
 
+            if let Err(AccountCapExceeded) =
+                state.rooms.try_set_account_name(peer_id, Some(account_name.clone()))
+            {
+                tracing::info!(
+                    "Rejecting JoinRoom from {} (room={}): account {} at connection cap",
+                    peer_id, room_id, account_name
+                );
+                let _ = direct_tx.send(ServerMessage::JoinRejected {
+                    room_id: room_id.clone(),
+                    reason: "account has too many active connections".to_string(),
+                });
+                return;
+            }
+
             if let Some(peers) =
-                state.rooms.join_room(peer_id, &room_id, &player_name, Some(account_name))
+                state.rooms.join_room(peer_id, &room_id, &player_name)
             {
                 let response = ServerMessage::RoomJoined {
                     room_id: room_id.clone(),
@@ -256,20 +305,87 @@ async fn handle_client_message(
             } else {
                 crate::gw2::validate_api_key(&state.http, &state.gw2_cache, trimmed).await
             };
-            state
-                .rooms
-                .set_account_name(peer_id, account_name.clone());
-            let _ = direct_tx.send(ServerMessage::AccountValidated { account_name });
-        }
-
-        ClientMessage::LeaveRoom => {
-            if let Some(room_id) = state.rooms.get_peer_room(peer_id) {
-                state.rooms.leave_room(peer_id, &room_id);
+            match state.rooms.try_set_account_name(peer_id, account_name.clone()) {
+                Ok(()) => {
+                    let _ = direct_tx.send(ServerMessage::AccountValidated { account_name });
+                }
+                Err(AccountCapExceeded) => {
+                    // The key validated, but the account already has too many
+                    // active connections. Surface it as a failed validation so
+                    // the client UI doesn't think it's authenticated.
+                    if let Some(name) = account_name.as_ref() {
+                        tracing::info!(
+                            "ValidateApiKey from {} rejected: account {} at connection cap",
+                            peer_id, name
+                        );
+                    }
+                    let _ = direct_tx.send(ServerMessage::AccountValidated { account_name: None });
+                    let _ = direct_tx.send(ServerMessage::Error {
+                        message: "account has too many active connections".to_string(),
+                    });
+                }
             }
         }
 
+        ClientMessage::LeaveRoom { room_id } => match room_id {
+            Some(id) => state.rooms.leave_room(peer_id, &id),
+            None => state.rooms.leave_all_rooms(peer_id),
+        },
+
         ClientMessage::UpdatePosition { position, front } => {
             state.rooms.update_position(peer_id, position, front);
+        }
+
+        ClientMessage::IdentifyGroup { members } => {
+            // Anonymous peers can't identify a group — squad clusters key
+            // off account identity, and we want to be sure the requester
+            // is actually one of the members they're listing.
+            let Some(own_account) = state.rooms.peer_account_name(peer_id) else {
+                tracing::info!(
+                    "Dropping IdentifyGroup from {}: no bound account",
+                    peer_id
+                );
+                return;
+            };
+            // Sender must be in the report — protects against a peer
+            // claiming membership in someone else's squad.
+            let mut deduped: HashSet<String> = members.into_iter().collect();
+            if !deduped.contains(&own_account) {
+                tracing::info!(
+                    "Dropping IdentifyGroup from {}: report omits sender {}",
+                    peer_id,
+                    own_account
+                );
+                return;
+            }
+            // Trim the set down to what the registry needs and call.
+            // The registry takes a `HashSet<String>` so dedup happens for
+            // free, but cap the size before allocating into the hasher.
+            if deduped.len() > MAX_GROUP_REPORT_MEMBERS {
+                tracing::warn!(
+                    "IdentifyGroup from {} truncated: {} > cap {}",
+                    peer_id,
+                    deduped.len(),
+                    MAX_GROUP_REPORT_MEMBERS
+                );
+                // Keep an arbitrary subset including the sender.
+                let mut keep: HashSet<String> = HashSet::new();
+                keep.insert(own_account.clone());
+                for name in deduped.drain() {
+                    if keep.len() >= MAX_GROUP_REPORT_MEMBERS {
+                        break;
+                    }
+                    keep.insert(name);
+                }
+                deduped = keep;
+            }
+            let cluster_id = state.squads.identify(deduped);
+            tracing::info!(
+                "IdentifyGroup from {}: cluster={}",
+                peer_id,
+                cluster_id
+            );
+            let _ = direct_tx.send(ServerMessage::GroupIdentified { cluster_id });
         }
 
         ClientMessage::Ping => {
@@ -303,6 +419,17 @@ fn validate_message_lengths(peer_id: &str, msg: &ClientMessage) -> bool {
         ClientMessage::ValidateApiKey { api_key } => {
             !too_long("api_key", api_key.len(), MAX_API_KEY_LEN)
         }
+        ClientMessage::IdentifyGroup { members, .. } => {
+            if too_long("members", members.len(), MAX_GROUP_REPORT_MEMBERS) {
+                return false;
+            }
+            for name in members {
+                if too_long("members[i]", name.len(), MAX_ACCOUNT_NAME_LEN) {
+                    return false;
+                }
+            }
+            true
+        }
         _ => true,
     }
 }
@@ -314,8 +441,9 @@ fn apply_rate_limit(peer_id: &str, msg: &ClientMessage, rates: &mut PeerRateLimi
         ClientMessage::JoinRoom { .. } => &mut rates.join_room,
         ClientMessage::ValidateApiKey { .. } => &mut rates.validate_api_key,
         ClientMessage::UpdatePosition { .. } => &mut rates.update_position,
+        ClientMessage::IdentifyGroup { .. } => &mut rates.identify_group,
         // LeaveRoom and Ping are cheap and bounded by the connection itself.
-        ClientMessage::LeaveRoom | ClientMessage::Ping => return true,
+        ClientMessage::LeaveRoom { .. } | ClientMessage::Ping => return true,
     };
     if bucket.try_take() {
         true
@@ -329,8 +457,9 @@ fn msg_kind(msg: &ClientMessage) -> &'static str {
     match msg {
         ClientMessage::JoinRoom { .. } => "JoinRoom",
         ClientMessage::ValidateApiKey { .. } => "ValidateApiKey",
-        ClientMessage::LeaveRoom => "LeaveRoom",
+        ClientMessage::LeaveRoom { .. } => "LeaveRoom",
         ClientMessage::UpdatePosition { .. } => "UpdatePosition",
+        ClientMessage::IdentifyGroup { .. } => "IdentifyGroup",
         ClientMessage::Ping => "Ping",
     }
 }
@@ -355,7 +484,10 @@ mod tests {
             "p",
             &ClientMessage::ValidateApiKey { api_key: "k".to_string() }
         ));
-        assert!(validate_message_lengths("p", &ClientMessage::LeaveRoom));
+        assert!(validate_message_lengths(
+            "p",
+            &ClientMessage::LeaveRoom { room_id: None }
+        ));
         assert!(validate_message_lengths("p", &ClientMessage::Ping));
     }
 
@@ -401,13 +533,18 @@ mod tests {
     #[test]
     fn rate_limit_charges_correct_bucket() {
         let mut rates = PeerRateLimits::new();
-        // JoinRoom bucket has burst=2; third call within the same instant
-        // must be rejected.
-        assert!(apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
-        assert!(apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+        // JoinRoom bucket has burst=8; the 9th call within the same
+        // instant must be rejected.
+        for _ in 0..8 {
+            assert!(apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+        }
         assert!(!apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
         // LeaveRoom and Ping bypass the buckets — they should still pass.
-        assert!(apply_rate_limit("p", &ClientMessage::LeaveRoom, &mut rates));
+        assert!(apply_rate_limit(
+            "p",
+            &ClientMessage::LeaveRoom { room_id: None },
+            &mut rates
+        ));
         assert!(apply_rate_limit("p", &ClientMessage::Ping, &mut rates));
     }
 }
