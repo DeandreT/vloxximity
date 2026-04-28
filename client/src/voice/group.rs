@@ -1,12 +1,13 @@
 //! Local cache of the GW2 group as observed via Nexus RTAPI events.
 //!
 //! RTAPI exposes per-member events (`RTAPI_GROUP_MEMBER_JOINED/LEFT/UPDATE`)
-//! with no polling endpoint, so we maintain state from the event stream and
-//! periodically forward a snapshot to the server for clustering. This module
-//! owns the snapshot; the manager handles debouncing and the network round
-//! trip.
+//! with no polling endpoint for the member list, so we maintain state from
+//! the event stream and periodically forward a snapshot to the server for
+//! clustering. Group *shape* (`None` / `Party` / `Squad`) comes from the
+//! polled RTAPI group snapshot in the manager update loop.
 
 use std::collections::HashMap;
+use nexus::rtapi::GroupType;
 
 /// Subset of `nexus::rtapi::GroupMember` we keep — only the fields the
 /// suggestion logic needs. Storing owned strings (vs the FFI struct's
@@ -21,14 +22,28 @@ pub struct GroupMemberSnapshot {
     pub is_commander: bool,
 }
 
-/// Differentiates the shapes the local user might be in. Mirrors
-/// `nexus::rtapi::GroupType` but stays decoupled from the nexus enum so we
-/// can update it without churn in the rest of the manager.
+/// Differentiates the shapes the local user might be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupKind {
     None,
     Party,
     Squad,
+}
+
+impl GroupKind {
+    pub fn from_rtapi(group_type: GroupType, member_count: u32) -> Self {
+        match group_type {
+            GroupType::None => GroupKind::None,
+            GroupType::Party => {
+                if member_count >= 2 {
+                    GroupKind::Party
+                } else {
+                    GroupKind::None
+                }
+            }
+            GroupType::RaidSquad | GroupType::Squad => GroupKind::Squad,
+        }
+    }
 }
 
 /// Kind of event we received from RTAPI. The dispatcher converts the raw
@@ -113,32 +128,6 @@ impl GroupState {
     pub fn clear(&mut self) {
         self.members.clear();
     }
-
-    /// Best-effort classification of the current group.
-    /// - `None` when the cache is empty, or holds a single player who is
-    ///   *not* a commander and not in a numbered subgroup (i.e. RTAPI is
-    ///   reporting an out-of-group state).
-    /// - `Squad` if any member has `subgroup >= 1` (the GW2 way of saying
-    ///   "tagged squad with subgroup assignments") OR a commander is set.
-    ///   A solo tagged commander counts — the server clusters their id so
-    ///   later joiners can converge on the same room.
-    /// - `Party` for small groups with no commander and no subgroups.
-    pub fn classify(&self) -> GroupKind {
-        if self.members.is_empty() {
-            return GroupKind::None;
-        }
-        let any_subgroup = self.members.values().any(|m| m.subgroup >= 1);
-        let any_commander = self.members.values().any(|m| m.is_commander);
-        if any_subgroup || any_commander {
-            GroupKind::Squad
-        } else if self.members.len() >= 2 {
-            GroupKind::Party
-        } else {
-            // Single non-commander, non-subgroup member = local player
-            // sitting outside any group.
-            GroupKind::None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -200,26 +189,24 @@ mod tests {
     }
 
     #[test]
-    fn classify_returns_none_for_solo() {
-        let mut g = GroupState::new();
-        let _ = g.apply(GroupMemberEvent::Joined(snap("A.1", 0, true, false)));
-        assert_eq!(g.classify(), GroupKind::None);
+    fn rtapi_none_maps_to_none() {
+        assert_eq!(GroupKind::from_rtapi(GroupType::None, 0), GroupKind::None);
     }
 
     #[test]
-    fn classify_party_has_no_subgroup_or_commander() {
-        let mut g = GroupState::new();
-        let _ = g.apply(GroupMemberEvent::Joined(snap("A.1", 0, true, false)));
-        let _ = g.apply(GroupMemberEvent::Joined(snap("B.2", 0, false, false)));
-        assert_eq!(g.classify(), GroupKind::Party);
+    fn rtapi_party_of_one_maps_to_none() {
+        assert_eq!(GroupKind::from_rtapi(GroupType::Party, 1), GroupKind::None);
     }
 
     #[test]
-    fn classify_squad_when_commander_present() {
-        let mut g = GroupState::new();
-        let _ = g.apply(GroupMemberEvent::Joined(snap("A.1", 0, true, true)));
-        let _ = g.apply(GroupMemberEvent::Joined(snap("B.2", 0, false, false)));
-        assert_eq!(g.classify(), GroupKind::Squad);
+    fn rtapi_party_maps_to_party() {
+        assert_eq!(GroupKind::from_rtapi(GroupType::Party, 2), GroupKind::Party);
+    }
+
+    #[test]
+    fn rtapi_squads_map_to_squad() {
+        assert_eq!(GroupKind::from_rtapi(GroupType::Squad, 1), GroupKind::Squad);
+        assert_eq!(GroupKind::from_rtapi(GroupType::RaidSquad, 1), GroupKind::Squad);
     }
 
     #[test]

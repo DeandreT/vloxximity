@@ -13,6 +13,7 @@ use crate::audio::thread::AudioCommand;
 use crate::audio::{AudioThread, IncomingAudioCommand, OpusEncoder, VoiceActivityDetector};
 use crate::network::{ConnectionState, PeerInfo, ServerMessage, SignalingClient};
 use crate::position::MumbleLink;
+use nexus::rtapi::RealTimeApi;
 
 use super::active_speak::ActiveSpeak;
 use super::group::{GroupKind, GroupMemberEvent, GroupState};
@@ -260,6 +261,8 @@ pub struct VoiceManager {
 
     // Most recent server-issued cluster id for the local group.
     last_cluster_id: Option<String>,
+    rtapi_group_kind: GroupKind,
+    rtapi_group_member_count: usize,
 
     // Shutdown flag
     shutdown: bool,
@@ -316,6 +319,8 @@ impl VoiceManager {
             group: GroupState::new(),
             pending_identify_at: None,
             last_cluster_id: None,
+            rtapi_group_kind: GroupKind::None,
+            rtapi_group_member_count: 0,
             shutdown: false,
         }
     }
@@ -398,6 +403,7 @@ impl VoiceManager {
 
         // Process network events
         self.process_network_events()?;
+        self.refresh_group_kind_from_rtapi();
 
         // Read MumbleLink and handle room changes
         if let Some(state) = self.mumble_link.read() {
@@ -527,7 +533,7 @@ impl VoiceManager {
     /// hasn't replied yet.
     pub fn group_suggestions(&self) -> Option<GroupSuggestions> {
         let cluster = self.last_cluster_id.as_ref()?;
-        let kind = self.group.classify();
+        let kind = self.rtapi_group_kind;
         if matches!(kind, GroupKind::None) {
             return None;
         }
@@ -538,7 +544,7 @@ impl VoiceManager {
         };
         Some(GroupSuggestions {
             room_id,
-            member_count: self.group.member_count(),
+            member_count: self.rtapi_group_member_count,
             commander_account_name: self.group.commander_name().map(str::to_string),
             kind,
         })
@@ -751,7 +757,7 @@ impl VoiceManager {
     /// Read the local GW2 account handle from Nexus RTAPI if present.
     /// Called once on `init` and on demand from the settings UI.
     pub fn refresh_own_account_name(&mut self) {
-        self.own_account_name = nexus::rtapi::RealTimeApi::get()
+        self.own_account_name = RealTimeApi::get()
             .and_then(|api| api.read_player())
             .map(|player| player.account_name)
             .filter(|name| !name.is_empty());
@@ -765,6 +771,21 @@ impl VoiceManager {
     /// Local GW2 account handle if we read it from RTAPI.
     pub fn own_account_name(&self) -> Option<&str> {
         self.own_account_name.as_deref()
+    }
+
+    fn refresh_group_kind_from_rtapi(&mut self) {
+        let Some(group) = RealTimeApi::get().and_then(|api| api.read_group()) else {
+            self.rtapi_group_kind = GroupKind::None;
+            self.rtapi_group_member_count = 0;
+            return;
+        };
+
+        self.rtapi_group_member_count = group.group_member_count as usize;
+        self.rtapi_group_kind = group
+            .group_type
+            .ok()
+            .map(|ty| GroupKind::from_rtapi(ty, group.group_member_count))
+            .unwrap_or(GroupKind::None);
     }
 
     /// Reason the server last rejected a JoinRoom, if still relevant.
