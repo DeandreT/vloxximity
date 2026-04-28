@@ -11,16 +11,21 @@ pub mod ui;
 pub mod voice;
 mod nexus_logger;
 
+use nexus::event::event_consume;
 use nexus::gui::{register_render, render, RenderType};
 use nexus::imgui::{Condition, Ui, Window};
 use nexus::keybind::{keybind_handler, register_keybind_with_string};
 use nexus::log::{log, LogLevel};
+use nexus::rtapi::event::{
+    RTAPI_GROUP_MEMBER_JOINED, RTAPI_GROUP_MEMBER_LEFT, RTAPI_GROUP_MEMBER_UPDATE,
+};
+use nexus::rtapi::GroupMember;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
 use ui::SettingsWindow;
-use voice::VoiceManager;
+use voice::{GroupMemberEvent, GroupMemberSnapshot, RoomType, VoiceManager};
 
 /// Addon version
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -95,13 +100,54 @@ fn addon_load() {
             register_render(RenderType::Render, render!(render_main)).revert_on_unload();
             register_render(RenderType::OptionsRender, render!(render_options)).revert_on_unload();
 
-            // Register keybinds
+            // Register keybinds — default PTT plus per-type PTTs.
+            // The default key talks into the resolved fallback room
+            // (squad > party > map); the per-type keys force
+            // routing strictly into that room type and override the
+            // default when held.
             let ptt_handler = keybind_handler!(handle_ptt);
             register_keybind_with_string("Push To Talk", ptt_handler, "")
                 .revert_on_unload();
 
+            let map_handler = keybind_handler!(handle_ptt_per_type);
+            register_keybind_with_string("Push To Talk (Map)", map_handler, "")
+                .revert_on_unload();
+            let squad_handler = keybind_handler!(handle_ptt_per_type);
+            register_keybind_with_string("Push To Talk (Squad)", squad_handler, "")
+                .revert_on_unload();
+            let party_handler = keybind_handler!(handle_ptt_per_type);
+            register_keybind_with_string("Push To Talk (Party)", party_handler, "")
+                .revert_on_unload();
+
             let toggle_handler = keybind_handler!(handle_toggle);
             register_keybind_with_string("Settings Window Toggle", toggle_handler, "")
+                .revert_on_unload();
+
+            // Subscribe to RTAPI group-member events. The callbacks fire
+            // on whatever thread Nexus uses to dispatch events; they pull
+            // the global AddonState and forward into the manager.
+            RTAPI_GROUP_MEMBER_JOINED
+                .subscribe(event_consume!(<GroupMember> |data| {
+                    if let Some(member) = data {
+                        forward_group_event(GroupMemberEvent::Joined(snapshot_from(member)));
+                    }
+                }))
+                .revert_on_unload();
+            RTAPI_GROUP_MEMBER_UPDATE
+                .subscribe(event_consume!(<GroupMember> |data| {
+                    if let Some(member) = data {
+                        forward_group_event(GroupMemberEvent::Updated(snapshot_from(member)));
+                    }
+                }))
+                .revert_on_unload();
+            RTAPI_GROUP_MEMBER_LEFT
+                .subscribe(event_consume!(<GroupMember> |data| {
+                    if let Some(member) = data {
+                        forward_group_event(GroupMemberEvent::Left {
+                            account_name: member.account_name(),
+                        });
+                    }
+                }))
                 .revert_on_unload();
 
             log(LogLevel::Info, "Vloxximity", "Vloxximity loaded successfully");
@@ -266,11 +312,31 @@ fn render_speaking_indicator(ui: &Ui, voice_manager: &VoiceManager) {
         });
 }
 
-/// Handle PTT keybind
+/// Handle the default PTT keybind ("Push To Talk").
 fn handle_ptt(_identifier: &str, is_release: bool) {
     if let Some(state) = AddonState::get() {
         // Press = talking, release = not talking
         state.voice_manager.read().set_ptt(!is_release);
+    }
+}
+
+/// Handle the per-room-type PTT keybinds. Routes by identifier into
+/// the shared `ActiveSpeak` state.
+fn handle_ptt_per_type(identifier: &str, is_release: bool) {
+    let Some(ty) = (match identifier {
+        "Push To Talk (Map)" => Some(RoomType::Map),
+        "Push To Talk (Squad)" => Some(RoomType::Squad),
+        "Push To Talk (Party)" => Some(RoomType::Party),
+        _ => None,
+    }) else {
+        return;
+    };
+    if let Some(state) = AddonState::get() {
+        state
+            .voice_manager
+            .read()
+            .active_speak_handle()
+            .set_per_type(ty, !is_release);
     }
 }
 
@@ -282,5 +348,26 @@ fn handle_toggle(_identifier: &str, is_release: bool) {
 
     if let Some(state) = AddonState::get() {
         state.settings_window.write().toggle();
+    }
+}
+
+/// Convert the FFI [`GroupMember`] into our owned snapshot type. Called
+/// from the RTAPI event callbacks which receive a raw pointer pointee.
+fn snapshot_from(member: &GroupMember) -> GroupMemberSnapshot {
+    GroupMemberSnapshot {
+        account_name: member.account_name(),
+        character_name: member.character_name(),
+        subgroup: member.subgroup,
+        is_self: member.is_self(),
+        is_commander: member.is_commander(),
+    }
+}
+
+/// Forward a parsed RTAPI event to the voice manager. Acquires the
+/// manager write lock; the keybind / render paths take the same lock so
+/// concurrent fires are serialized.
+fn forward_group_event(event: GroupMemberEvent) {
+    if let Some(state) = AddonState::get() {
+        state.voice_manager.write().handle_group_member_event(event);
     }
 }

@@ -2,6 +2,7 @@
 
 use crate::voice::{VoiceManager, VoiceMode, VoiceSettings};
 use crate::voice::manager::ApiKeyStatus;
+use crate::voice::room_type::RoomType;
 use nexus::imgui::{Condition, InputTextFlags, Selectable, Slider, TreeNodeFlags, Ui, Window};
 
 /// Settings window state
@@ -24,6 +25,11 @@ pub struct SettingsWindow {
     // Account tab state
     api_key_buffer: String,
     api_key_visible: bool,
+    // Manual room-join input
+    join_room_buffer: String,
+    join_room_error: Option<String>,
+    pending_join_room: Option<String>,
+    pending_leave_rooms: Vec<String>,
 }
 
 impl SettingsWindow {
@@ -43,6 +49,10 @@ impl SettingsWindow {
             pending_output_device: None,
             api_key_buffer: String::new(),
             api_key_visible: false,
+            join_room_buffer: String::new(),
+            join_room_error: None,
+            pending_join_room: None,
+            pending_leave_rooms: Vec::new(),
         }
     }
 
@@ -237,6 +247,25 @@ impl SettingsWindow {
                     {
                         new_settings.output_volume = output_vol / 100.0;
                         settings_changed = true;
+                    }
+
+                    ui.spacing();
+                    ui.text_disabled("Per-room-type volumes (multiplied with output)");
+                    let types = [
+                        RoomType::Map,
+                        RoomType::Squad,
+                        RoomType::Party,
+                    ];
+                    for ty in types {
+                        let mut v = new_settings.room_type_volumes.get(ty);
+                        let label = format!("{}##room_vol", ty.label());
+                        if Slider::new(label, 0.0_f32, 2.0_f32)
+                            .display_format("%.2f")
+                            .build(ui, &mut v)
+                        {
+                            new_settings.room_type_volumes.set(ty, v);
+                            settings_changed = true;
+                        }
                     }
                 }
 
@@ -438,6 +467,91 @@ impl SettingsWindow {
 
                 ui.separator();
 
+                // RTAPI-derived suggestions (server-clustered squad/party ids).
+                // Only shown when the local player is in a multi-member group
+                // and the server has issued a cluster id. Click-to-join hooks
+                // straight into the existing manual-join flow.
+                if let Some(suggestions) = voice_manager.group_suggestions() {
+                    if ui.collapsing_header("Suggested rooms", TreeNodeFlags::DEFAULT_OPEN) {
+                        let already_joined: std::collections::HashSet<String> = voice_manager
+                            .rooms_with_peer_counts()
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect();
+                        let room_label = match suggestions.kind {
+                            crate::voice::GroupKind::Squad => "Squad",
+                            crate::voice::GroupKind::Party => "Party",
+                            crate::voice::GroupKind::None => "Group",
+                        };
+                        let label_lead = match suggestions.commander_account_name.as_deref() {
+                            Some(name) => format!("{}: {} ({} members)", room_label, name, suggestions.member_count),
+                            None => format!("{}: {} members", room_label, suggestions.member_count),
+                        };
+                        ui.text(format!("{} → {}", label_lead, suggestions.room_id));
+                        ui.same_line();
+                        if already_joined.contains(&suggestions.room_id) {
+                            ui.text_disabled("joined");
+                        } else if ui.small_button(format!("Join##suggest_group")) {
+                            self.pending_join_room = Some(suggestions.room_id.clone());
+                            self.join_room_error = None;
+                        }
+                    }
+                    ui.separator();
+                }
+
+                // Manual room join + active rooms list
+                if ui.collapsing_header("Rooms", TreeNodeFlags::DEFAULT_OPEN) {
+                    ui.text("Active rooms:");
+                    let rooms = voice_manager.rooms_with_peer_counts();
+                    if rooms.is_empty() {
+                        ui.text_disabled("  (none)");
+                    } else {
+                        for (room_id, peers_count) in rooms {
+                            let badge = match RoomType::from_room_id(&room_id) {
+                                Some(t) => t.label(),
+                                None => "Other",
+                            };
+                            ui.text(format!(
+                                "  [{}] {}  ({} peers)",
+                                badge, room_id, peers_count
+                            ));
+                            ui.same_line();
+                            if ui.small_button(format!("Leave##{}", room_id)) {
+                                self.pending_leave_rooms.push(room_id.clone());
+                            }
+                        }
+                    }
+
+                    ui.spacing();
+                    ui.text("Join room (e.g. squad:my-squad-id)");
+                    ui.set_next_item_width(-100.0);
+                    ui.input_text("##join_room", &mut self.join_room_buffer)
+                        .hint("squad:foo / party:bar / map:baz")
+                        .flags(InputTextFlags::empty())
+                        .build();
+                    ui.same_line();
+                    if ui.button("Join##room") {
+                        let id = self.join_room_buffer.trim().to_string();
+                        if id.is_empty() {
+                            self.join_room_error = Some("Enter a room id first".to_string());
+                        } else if RoomType::from_room_id(&id).is_none() {
+                            self.join_room_error = Some(
+                                "Room id must start with map:, squad:, or party:"
+                                    .to_string(),
+                            );
+                        } else {
+                            self.pending_join_room = Some(id);
+                            self.join_room_buffer.clear();
+                            self.join_room_error = None;
+                        }
+                    }
+                    if let Some(err) = &self.join_room_error {
+                        ui.text_colored([1.0, 0.4, 0.4, 1.0], format!("[!] {}", err));
+                    }
+                }
+
+                ui.separator();
+
                 // Peer list
                 if ui.collapsing_header("Nearby Players", TreeNodeFlags::DEFAULT_OPEN) {
                     let peers = voice_manager.get_peers();
@@ -515,6 +629,7 @@ impl SettingsWindow {
                 s.spatial_3d_enabled = settings.spatial_3d_enabled;
                 s.show_peer_markers = settings.show_peer_markers;
                 s.gw2_api_key = settings.gw2_api_key;
+                s.room_type_volumes = settings.room_type_volumes;
             });
             crate::voice::persist::save_settings(&voice_manager.settings());
 
@@ -529,6 +644,16 @@ impl SettingsWindow {
         // Apply pending mutes
         for (peer_id, muted) in self.pending_mutes.drain(..) {
             voice_manager.mute_peer(&peer_id, muted);
+        }
+
+        // Apply pending room operations
+        if let Some(id) = self.pending_join_room.take() {
+            if let Err(e) = voice_manager.join_room_manual(&id) {
+                self.join_room_error = Some(e.to_string());
+            }
+        }
+        for room_id in self.pending_leave_rooms.drain(..) {
+            voice_manager.leave_room_manual(&room_id);
         }
     }
 }

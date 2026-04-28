@@ -152,6 +152,7 @@ fn delete_api_key_from_keyring() {}
 mod tests {
     use super::*;
     use crate::voice::manager::VoiceMode;
+    use crate::voice::room_type::RoomType;
 
     fn roundtrip_settings(settings: &VoiceSettings) -> VoiceSettings {
         let text = serde_json::to_string(settings).expect("serialize");
@@ -220,5 +221,20 @@ mod tests {
         let parsed: VoiceSettings = serde_json::from_str(json).expect("parse");
         assert_eq!(parsed.server_url, "ws://legacy.example/ws");
         assert_eq!(parsed.min_distance, VoiceSettings::default().min_distance);
+        // Newly added field falls back to its default when omitted.
+        assert_eq!(parsed.room_type_volumes.get(RoomType::Map), 1.0);
+    }
+
+    #[test]
+    fn settings_roundtrip_preserves_room_type_volumes() {
+        let mut original = VoiceSettings::default();
+        original.room_type_volumes.set(RoomType::Map, 0.4);
+        original.room_type_volumes.set(RoomType::Squad, 1.2);
+        original.room_type_volumes.set(RoomType::Party, 0.8);
+
+        let restored = roundtrip_settings(&original);
+        assert!((restored.room_type_volumes.get(RoomType::Map) - 0.4).abs() < 1e-6);
+        assert!((restored.room_type_volumes.get(RoomType::Squad) - 1.2).abs() < 1e-6);
+        assert!((restored.room_type_volumes.get(RoomType::Party) - 0.8).abs() < 1e-6);
     }
 }
