@@ -140,9 +140,20 @@ impl MumbleLink {
         // Parse identity JSON
         let identity = parse_identity(&link.identity);
 
-        // Parse context
-        let context = if (link.context_len as usize) >= std::mem::size_of::<MumbleContext>() {
-            // Read the context as a possibly unaligned MumbleContext from the local copy
+        // Parse context.
+        //
+        // GW2 reports `context_len` in the 48–85 byte range — the meaningful
+        // prefix of the 256-byte context buffer. Our `MumbleContext` is 88
+        // bytes after C struct padding, so checking `>= size_of::<...>()`
+        // silently falls through to defaults on every read and the room_key
+        // hash never changes when the player waypoints. Only the first 44
+        // bytes (server_address + map_id + map_type + shard_id + instance)
+        // are needed for the room key, and the underlying buffer is 256
+        // bytes, so the wider `read_unaligned` is memory-safe even when
+        // GW2 has only populated a prefix — fields past `context_len` may
+        // contain stale bytes but we don't read them for routing.
+        const MIN_CONTEXT_LEN_FOR_ROOM_KEY: usize = 44;
+        let context = if (link.context_len as usize) >= MIN_CONTEXT_LEN_FOR_ROOM_KEY {
             unsafe { std::ptr::read_unaligned(link.context.as_ptr() as *const MumbleContext) }
         } else {
             MumbleContext::default()
@@ -186,9 +197,6 @@ fn parse_identity(identity: &[u16; 256]) -> Option<PlayerIdentity> {
     if identity_str.is_empty() {
         return None;
     }
-
-    // Log raw identity for debugging
-    log::debug!("Raw identity JSON: {}", identity_str);
 
     #[derive(serde::Deserialize)]
     struct RawIdentity {
