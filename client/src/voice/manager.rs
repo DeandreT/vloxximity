@@ -4,8 +4,8 @@ use anyhow::Result;
 use parking_lot::RwLock as PlRwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -164,29 +164,71 @@ pub enum NetworkCommand {
         player_name: String,
         api_key: Option<String>,
     },
-    ValidateApiKey { api_key: String },
+    ValidateApiKey {
+        api_key: String,
+    },
     /// Leave a single room (`Some`) or every joined room (`None`).
-    LeaveRoom { room_id: Option<String> },
-    UpdatePosition { position: crate::position::Position, front: crate::position::Position },
-    SendAudio { room_id: String, data: Vec<u8> },
+    LeaveRoom {
+        room_id: Option<String>,
+    },
+    UpdatePosition {
+        position: crate::position::Position,
+        front: crate::position::Position,
+    },
+    SendAudio {
+        room_id: String,
+        data: Vec<u8>,
+    },
     /// Forward a debounced group snapshot to the server for clustering.
-    IdentifyGroup { members: Vec<String> },
+    IdentifyGroup {
+        members: Vec<String>,
+    },
 }
 
 /// Events received from the network task
 #[derive(Debug)]
 pub enum NetworkEvent {
-    Connected { peer_id: String },
+    Connected {
+        peer_id: String,
+    },
     Disconnected,
-    AccountValidated { account_name: Option<String> },
-    RoomJoined { room_id: String, peers: Vec<PeerInfo> },
-    JoinRejected { room_id: String, reason: String },
-    PeerJoined { room_id: String, peer_id: String, player_name: String, account_name: Option<String> },
-    PeerLeft { room_id: String, peer_id: String },
-    PeerPosition { peer_id: String, position: crate::position::Position, front: crate::position::Position },
-    AudioReceived { room_id: String, peer_id: String, data: Vec<u8> },
-    GroupIdentified { cluster_id: String },
-    Error { message: String },
+    AccountValidated {
+        account_name: Option<String>,
+    },
+    RoomJoined {
+        room_id: String,
+        peers: Vec<PeerInfo>,
+    },
+    JoinRejected {
+        room_id: String,
+        reason: String,
+    },
+    PeerJoined {
+        room_id: String,
+        peer_id: String,
+        player_name: String,
+        account_name: Option<String>,
+    },
+    PeerLeft {
+        room_id: String,
+        peer_id: String,
+    },
+    PeerPosition {
+        peer_id: String,
+        position: crate::position::Position,
+        front: crate::position::Position,
+    },
+    AudioReceived {
+        room_id: String,
+        peer_id: String,
+        data: Vec<u8>,
+    },
+    GroupIdentified {
+        cluster_id: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Central voice manager
@@ -530,8 +572,7 @@ impl VoiceManager {
 
         // 300 ms debounce on top of the per-bucket rate limit. The flush
         // path in `update()` will fire the actual `IdentifyGroup`.
-        self.pending_identify_at =
-            Some(Instant::now() + std::time::Duration::from_millis(300));
+        self.pending_identify_at = Some(Instant::now() + std::time::Duration::from_millis(300));
     }
 
     /// Send an `IdentifyGroup` if the debounce timer has expired and the
@@ -629,17 +670,44 @@ impl VoiceManager {
             let collected: Vec<NetworkEvent> = rx.try_iter().collect();
             for ev in collected.iter() {
                 match ev {
-                    NetworkEvent::PeerJoined { room_id, peer_id, player_name, account_name } => log::info!("  event: PeerJoined {} ({}) room={} account={:?}", player_name, peer_id, room_id, account_name),
-                    NetworkEvent::PeerPosition { peer_id, .. } => log::info!("  event: PeerPosition ({})", peer_id),
-                    NetworkEvent::AudioReceived { room_id, peer_id, .. } => log::info!("  event: AudioReceived ({} in {})", peer_id, room_id),
-                    NetworkEvent::RoomJoined { room_id, peers } => log::info!("  event: RoomJoined {} ({} peers)", room_id, peers.len()),
-                    NetworkEvent::Connected { peer_id } => log::info!("  event: Connected ({})", peer_id),
+                    NetworkEvent::PeerJoined {
+                        room_id,
+                        peer_id,
+                        player_name,
+                        account_name,
+                    } => log::info!(
+                        "  event: PeerJoined {} ({}) room={} account={:?}",
+                        player_name,
+                        peer_id,
+                        room_id,
+                        account_name
+                    ),
+                    NetworkEvent::PeerPosition { peer_id, .. } => {
+                        log::info!("  event: PeerPosition ({})", peer_id)
+                    }
+                    NetworkEvent::AudioReceived {
+                        room_id, peer_id, ..
+                    } => log::info!("  event: AudioReceived ({} in {})", peer_id, room_id),
+                    NetworkEvent::RoomJoined { room_id, peers } => {
+                        log::info!("  event: RoomJoined {} ({} peers)", room_id, peers.len())
+                    }
+                    NetworkEvent::Connected { peer_id } => {
+                        log::info!("  event: Connected ({})", peer_id)
+                    }
                     NetworkEvent::Disconnected => log::info!("  event: Disconnected"),
-                    NetworkEvent::PeerLeft { room_id, peer_id } => log::info!("  event: PeerLeft ({} from {})", peer_id, room_id),
+                    NetworkEvent::PeerLeft { room_id, peer_id } => {
+                        log::info!("  event: PeerLeft ({} from {})", peer_id, room_id)
+                    }
                     NetworkEvent::Error { message } => log::info!("  event: Error: {}", message),
-                    NetworkEvent::AccountValidated { account_name } => log::info!("  event: AccountValidated account={:?}", account_name),
-                    NetworkEvent::JoinRejected { room_id, reason } => log::info!("  event: JoinRejected (room={}): {}", room_id, reason),
-                    NetworkEvent::GroupIdentified { cluster_id } => log::info!("  event: GroupIdentified cluster={}", cluster_id),
+                    NetworkEvent::AccountValidated { account_name } => {
+                        log::info!("  event: AccountValidated account={:?}", account_name)
+                    }
+                    NetworkEvent::JoinRejected { room_id, reason } => {
+                        log::info!("  event: JoinRejected (room={}): {}", room_id, reason)
+                    }
+                    NetworkEvent::GroupIdentified { cluster_id } => {
+                        log::info!("  event: GroupIdentified cluster={}", cluster_id)
+                    }
                 }
             }
             collected
@@ -660,7 +728,8 @@ impl VoiceManager {
                     // Re-issue every joined room after reconnect. We snapshot
                     // and clear the local set first, then route each through
                     // the normal join path so server acks repopulate it.
-                    let to_rejoin: Vec<String> = self.joined_rooms.drain().map(|(k, _)| k).collect();
+                    let to_rejoin: Vec<String> =
+                        self.joined_rooms.drain().map(|(k, _)| k).collect();
                     if !to_rejoin.is_empty() {
                         let player_name = self
                             .mumble_link
@@ -671,7 +740,11 @@ impl VoiceManager {
                         let api_key = self.api_key_to_send();
                         if api_key.is_none() {
                             let reason = "GW2 API key required to join rooms (set one in Vloxximity settings)";
-                            log::warn!("Skipping reconnect JoinRooms ({}): {}", to_rejoin.len(), reason);
+                            log::warn!(
+                                "Skipping reconnect JoinRooms ({}): {}",
+                                to_rejoin.len(),
+                                reason
+                            );
                             self.current_map_room = None;
                             self.last_join_rejection = Some(reason.to_string());
                         } else {
@@ -721,10 +794,18 @@ impl VoiceManager {
                         }
                     }
                 }
-                NetworkEvent::PeerJoined { room_id, peer_id, player_name, account_name } => {
+                NetworkEvent::PeerJoined {
+                    room_id,
+                    peer_id,
+                    player_name,
+                    account_name,
+                } => {
                     log::info!(
                         "Peer joined: {} ({}) in room {} account={:?}",
-                        player_name, peer_id, room_id, account_name
+                        player_name,
+                        peer_id,
+                        room_id,
+                        account_name
                     );
                     if let Err(e) = self.add_peer_to_room(
                         &peer_id,
@@ -739,10 +820,18 @@ impl VoiceManager {
                     log::info!("Peer left: {} from room {}", peer_id, room_id);
                     self.remove_peer_from_room(&peer_id, &room_id);
                 }
-                NetworkEvent::PeerPosition { peer_id, position, front } => {
+                NetworkEvent::PeerPosition {
+                    peer_id,
+                    position,
+                    front,
+                } => {
                     self.update_peer_position(&peer_id, position, front);
                 }
-                NetworkEvent::AudioReceived { room_id, peer_id, data } => {
+                NetworkEvent::AudioReceived {
+                    room_id,
+                    peer_id,
+                    data,
+                } => {
                     if let Err(e) = self.receive_peer_audio(&peer_id, &room_id, &data) {
                         log::trace!("Failed to receive audio from {}: {}", peer_id, e);
                     }
@@ -915,9 +1004,7 @@ impl VoiceManager {
         }
         self.mark_api_key_validating(&key);
         if let Some(tx) = &self.network_cmd_tx {
-            if let Err(e) = tx.send(NetworkCommand::ValidateApiKey {
-                api_key: key,
-            }) {
+            if let Err(e) = tx.send(NetworkCommand::ValidateApiKey { api_key: key }) {
                 log::warn!("Failed to queue ValidateApiKey command: {}", e);
                 *self.api_key_status.write() = ApiKeyStatus::Invalid {
                     message: "Not connected to signaling server".to_string(),
@@ -987,9 +1074,7 @@ impl VoiceManager {
         }
         for id in to_remove {
             self.peers.remove(&id);
-            self.send_incoming_audio_command(IncomingAudioCommand::RemovePeer {
-                peer_id: id,
-            });
+            self.send_incoming_audio_command(IncomingAudioCommand::RemovePeer { peer_id: id });
         }
         for id in to_drop_stream {
             self.send_incoming_audio_command(IncomingAudioCommand::RemovePeerFromRoom {
@@ -1139,12 +1224,18 @@ impl VoiceManager {
     ) -> Result<()> {
         log::info!(
             "add_peer called for {} (name={}, account={:?}), our_peer_id={:?}",
-            peer_id, player_name, account_name, self.our_peer_id
+            peer_id,
+            player_name,
+            account_name,
+            self.our_peer_id
         );
 
         // Don't add ourselves
         if Some(peer_id.to_string()) == self.our_peer_id {
-            log::info!("Skipping add_peer for {} because it matches our_peer_id", peer_id);
+            log::info!(
+                "Skipping add_peer for {} because it matches our_peer_id",
+                peer_id
+            );
             return Ok(());
         }
 
@@ -1181,7 +1272,11 @@ impl VoiceManager {
         }
 
         let ids: Vec<String> = self.peers.keys().cloned().collect();
-        log::info!("Peer added. now {} peers: [{}]", self.peers.len(), ids.join(", "));
+        log::info!(
+            "Peer added. now {} peers: [{}]",
+            self.peers.len(),
+            ids.join(", ")
+        );
 
         Ok(())
     }
@@ -1292,7 +1387,9 @@ impl VoiceManager {
     /// Switch the audio capture device by name.
     pub fn set_input_device(&mut self, name: &str) {
         if let Some(ref audio_thread) = self.audio_thread {
-            if let Err(e) = audio_thread.send_command(AudioCommand::SetInputDevice(name.to_string())) {
+            if let Err(e) =
+                audio_thread.send_command(AudioCommand::SetInputDevice(name.to_string()))
+            {
                 log::warn!("Failed to send SetInputDevice to audio thread: {}", e);
             } else {
                 log::info!("Requested input device change: {}", name);
@@ -1303,7 +1400,9 @@ impl VoiceManager {
     /// Switch the audio playback device by name.
     pub fn set_output_device(&mut self, name: &str) {
         if let Some(ref audio_thread) = self.audio_thread {
-            if let Err(e) = audio_thread.send_command(AudioCommand::SetOutputDevice(name.to_string())) {
+            if let Err(e) =
+                audio_thread.send_command(AudioCommand::SetOutputDevice(name.to_string()))
+            {
                 log::warn!("Failed to send SetOutputDevice to audio thread: {}", e);
             } else {
                 log::info!("Requested output device change: {}", name);
@@ -1338,10 +1437,7 @@ impl VoiceManager {
                 };
                 if changed {
                     persist::save_muted_accounts(&self.muted_accounts);
-                    log::info!(
-                        "Persisted mute set update: {} -> muted={}",
-                        name, muted
-                    );
+                    log::info!("Persisted mute set update: {} -> muted={}", name, muted);
                 }
             }
             None => {
@@ -1473,9 +1569,7 @@ impl VoiceManager {
             anyhow::bail!("Room id is empty");
         }
         if RoomType::from_room_id(id).is_none() {
-            anyhow::bail!(
-                "Room id must start with map:, squad:, or party:"
-            );
+            anyhow::bail!("Room id must start with map:, squad:, or party:");
         }
         if self.joined_rooms.contains_key(id) {
             return Ok(());
@@ -1788,13 +1882,23 @@ mod tests {
             .expect("add_peer");
 
         let peers = vm.get_peers();
-        let by_id: HashMap<String, bool> = peers
-            .into_iter()
-            .map(|p| (p.peer_id, p.is_muted))
-            .collect();
-        assert_eq!(by_id.get("peer-id-a"), Some(&true), "matched account auto-mutes");
-        assert_eq!(by_id.get("peer-id-b"), Some(&false), "unmatched account stays unmuted");
-        assert_eq!(by_id.get("peer-id-c"), Some(&false), "no account stays unmuted");
+        let by_id: HashMap<String, bool> =
+            peers.into_iter().map(|p| (p.peer_id, p.is_muted)).collect();
+        assert_eq!(
+            by_id.get("peer-id-a"),
+            Some(&true),
+            "matched account auto-mutes"
+        );
+        assert_eq!(
+            by_id.get("peer-id-b"),
+            Some(&false),
+            "unmatched account stays unmuted"
+        );
+        assert_eq!(
+            by_id.get("peer-id-c"),
+            Some(&false),
+            "no account stays unmuted"
+        );
     }
 
     /// `NearbyPeer.account_name` should carry the handle through to the UI.
@@ -1813,11 +1917,7 @@ mod tests {
     /// `reconcile_group_room` runs against the local state alone — exactly
     /// what we want to assert against.
     fn vm_for_reconcile() -> VoiceManager {
-        VoiceManager::with_persistence(
-            DEFAULT_SERVER_URL,
-            VoiceSettings::default(),
-            HashSet::new(),
-        )
+        VoiceManager::with_persistence(DEFAULT_SERVER_URL, VoiceSettings::default(), HashSet::new())
     }
 
     fn set_squad(vm: &mut VoiceManager, cluster: &str, members: u32) {

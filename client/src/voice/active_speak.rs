@@ -96,13 +96,9 @@ impl ActiveSpeak {
 
         // 1. Per-type PTTs: pick the latest-pressed held key.
         let mut held: Vec<(RoomType, Instant)> = Vec::new();
-        for (idx, ty) in [
-            RoomType::Map,
-            RoomType::Squad,
-            RoomType::Party,
-        ]
-        .iter()
-        .enumerate()
+        for (idx, ty) in [RoomType::Map, RoomType::Squad, RoomType::Party]
+            .iter()
+            .enumerate()
         {
             let key = &s.per_type[idx];
             if key.held {
@@ -195,11 +191,7 @@ mod tests {
         let a = ActiveSpeak::new();
         a.set_default(true);
         let now = Instant::now();
-        let r = rooms(&[
-            ("map:a", now),
-            ("squad:b", now),
-            ("party:c", now),
-        ]);
+        let r = rooms(&[("map:a", now), ("squad:b", now), ("party:c", now)]);
         assert_eq!(a.resolve(&r, true), Some("squad:b".to_string()));
     }
 

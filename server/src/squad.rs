@@ -192,7 +192,8 @@ mod tests {
         let id = r.identify(members(&["A.1", "B.2", "C.3"]));
         // Forge a stale `last_seen` on the cluster directly.
         if let Some(mut cluster) = r.clusters.get_mut(&id) {
-            cluster.last_seen = Instant::now() - SQUAD_CLUSTER_TTL - std::time::Duration::from_secs(1);
+            cluster.last_seen =
+                Instant::now() - SQUAD_CLUSTER_TTL - std::time::Duration::from_secs(1);
         }
         assert_eq!(r.cluster_count(), 1);
         r.sweep();
@@ -212,7 +213,8 @@ mod tests {
         let r = SquadRegistry::new();
         let id = r.identify(members(&["A.1", "B.2", "C.3"]));
         if let Some(mut cluster) = r.clusters.get_mut(&id) {
-            cluster.last_seen = Instant::now() - SQUAD_CLUSTER_TTL - std::time::Duration::from_secs(1);
+            cluster.last_seen =
+                Instant::now() - SQUAD_CLUSTER_TTL - std::time::Duration::from_secs(1);
         }
         // Even with full overlap, a TTL-expired cluster should not match
         // — sweep would drop it, and we don't want to resurrect it.
