@@ -1,5 +1,7 @@
-use log::{Record, Level, Metadata};
+use log::{Level, Metadata, Record};
 use nexus::log::{log as nexus_log, LogLevel};
+
+const ADDON_LOG_CHANNEL: &str = "Vloxximity";
 
 pub struct NexusLogger;
 
@@ -21,7 +23,7 @@ impl log::Log for NexusLogger {
             Level::Trace => LogLevel::Trace,
         };
 
-        let target = if record.target().is_empty() { "Vloxximity" } else { record.target() };
+        let target = log_channel(record);
         let mut msg = format!("{}", record.args());
 
         // Nexus converts the message to a CString internally and panics on an
@@ -44,4 +46,12 @@ pub fn init() -> Result<(), log::SetLoggerError> {
     log::set_boxed_logger(Box::new(NexusLogger))?;
     log::set_max_level(log::LevelFilter::Debug);
     Ok(())
+}
+
+fn log_channel(record: &Record) -> &str {
+    if cfg!(debug_assertions) && !record.target().is_empty() {
+        record.target()
+    } else {
+        ADDON_LOG_CHANNEL
+    }
 }
