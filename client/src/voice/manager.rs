@@ -52,6 +52,12 @@ pub enum VoiceMode {
 /// Default signaling server URL
 pub const DEFAULT_SERVER_URL: &str = "ws://localhost:8080/ws";
 
+/// Extract the cluster portion of a `squad:<id>` / `party:<id>` room id.
+/// Returns `None` for room ids that don't follow the prefixed scheme.
+fn cluster_id_from_room(room_id: &str) -> Option<&str> {
+    room_id.split_once(':').map(|(_, rest)| rest)
+}
+
 /// Voice manager settings. `#[serde(default)]` on the struct keeps older
 /// on-disk configs loadable as we add new fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +88,15 @@ pub struct VoiceSettings {
     /// per-peer and master output volumes.
     #[serde(default)]
     pub room_type_volumes: RoomTypeVolumes,
+    /// When true, the client auto-joins a `squad:<cluster>` or
+    /// `party:<cluster>` room while the local player is in a GW2
+    /// squad/party. The map room is always auto-managed off MumbleLink.
+    #[serde(default = "default_true")]
+    pub auto_join_group_rooms: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for VoiceSettings {
@@ -101,6 +116,7 @@ impl Default for VoiceSettings {
             server_url: DEFAULT_SERVER_URL.to_string(),
             gw2_api_key: String::new(),
             room_type_volumes: RoomTypeVolumes::default(),
+            auto_join_group_rooms: true,
         }
     }
 }
@@ -192,6 +208,14 @@ pub struct VoiceManager {
     /// separately from `joined_rooms` so a map change leaves only the old
     /// map room and not, e.g., a squad room the user manually joined.
     current_map_room: Option<String>,
+    /// The squad/party room (if any) the auto-join logic currently owns.
+    /// Cleared when the group disbands, the cluster id changes, the user
+    /// manually leaves the room, or the server rejects the join.
+    current_group_room: Option<String>,
+    /// Cluster ids the user has manually left this session. The reconciler
+    /// won't auto-rejoin a room whose cluster is in this set, until the
+    /// cluster id changes (e.g. a fresh squad is formed).
+    suppressed_clusters: HashSet<String>,
 
     // Audio thread (handles cpal on separate thread)
     audio_thread: Option<AudioThread>,
@@ -298,6 +322,8 @@ impl VoiceManager {
             mumble_link: MumbleLink::new(),
             joined_rooms: HashMap::new(),
             current_map_room: None,
+            current_group_room: None,
+            suppressed_clusters: HashSet::new(),
             audio_thread: None,
             encoder: None,
             vad: None,
@@ -474,6 +500,11 @@ impl VoiceManager {
         // Flush any pending RTAPI-driven group identification.
         self.flush_pending_identify();
 
+        // Reconcile the auto-managed squad/party room against the latest
+        // RTAPI group state and server cluster id. Runs after
+        // `process_network_events` so we see the freshest `last_cluster_id`.
+        self.reconcile_group_room();
+
         // Process outgoing audio
         self.process_outgoing_audio()?;
 
@@ -525,6 +556,47 @@ impl VoiceManager {
         let members = self.group.member_account_names();
         if let Some(tx) = &self.network_cmd_tx {
             let _ = tx.send(NetworkCommand::IdentifyGroup { members });
+        }
+    }
+
+    /// Auto-join / leave the squad-or-party room based on the current
+    /// RTAPI group state and the server-issued cluster id. Idempotent:
+    /// safe to call every tick. The map room is auto-managed separately
+    /// off MumbleLink in `update()`.
+    fn reconcile_group_room(&mut self) {
+        let target = if self.settings.auto_join_group_rooms {
+            self.group_suggestions().map(|s| s.room_id)
+        } else {
+            None
+        };
+        let target = target.filter(|id| {
+            // Don't re-join a cluster the user just manually left.
+            match cluster_id_from_room(id) {
+                Some(cluster) => !self.suppressed_clusters.contains(cluster),
+                None => true,
+            }
+        });
+
+        if self.current_group_room == target {
+            return;
+        }
+
+        if let Some(old) = self.current_group_room.take() {
+            self.leave_room(&old);
+        }
+
+        if let Some(new_room) = target {
+            let player_name = self
+                .mumble_link
+                .read()
+                .and_then(|s| s.identity.as_ref().map(|i| i.name.clone()))
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "Unknown".to_string());
+            if let Err(e) = self.join_room(&new_room, &player_name) {
+                log::warn!("Auto-join of {} failed: {}", new_room, e);
+                return;
+            }
+            self.current_group_room = Some(new_room);
         }
     }
 
@@ -693,6 +765,9 @@ impl VoiceManager {
                     if self.current_map_room.as_deref() == Some(room_id.as_str()) {
                         self.current_map_room = None;
                     }
+                    if self.current_group_room.as_deref() == Some(room_id.as_str()) {
+                        self.current_group_room = None;
+                    }
                     if self.joined_rooms.is_empty() {
                         self.state = VoiceState::Connected;
                         self.peers.clear();
@@ -824,10 +899,11 @@ impl VoiceManager {
         let key = self.settings.gw2_api_key.trim().to_string();
 
         // Invalidate any "already joined" / "locally refused" state tied to
-        // the previous key, so the next MumbleLink tick is free to retry
-        // the join with the new key.
+        // the previous key, so the next MumbleLink tick / group reconcile is
+        // free to retry the join with the new key.
         if self.state != VoiceState::InRoom {
             self.current_map_room = None;
+            self.current_group_room = None;
         }
         self.last_join_rejection = None;
 
@@ -1366,6 +1442,8 @@ impl VoiceManager {
         self.peers.clear();
         self.joined_rooms.clear();
         self.current_map_room = None;
+        self.current_group_room = None;
+        self.suppressed_clusters.clear();
         self.state = VoiceState::Disconnected;
     }
 
@@ -1415,6 +1493,14 @@ impl VoiceManager {
     pub fn leave_room_manual(&mut self, room_id: &str) {
         if self.current_map_room.as_deref() == Some(room_id) {
             self.current_map_room = None;
+        }
+        if self.current_group_room.as_deref() == Some(room_id) {
+            // Suppress auto-rejoin for this cluster until the cluster id
+            // changes (user explicitly opted out of this group room).
+            if let Some(cluster) = cluster_id_from_room(room_id) {
+                self.suppressed_clusters.insert(cluster.to_string());
+            }
+            self.current_group_room = None;
         }
         self.leave_room(room_id);
     }
@@ -1720,5 +1806,116 @@ mod tests {
         let peers = vm.get_peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].account_name.as_deref(), Some("Acc.4242"));
+    }
+
+    /// Drive the auto-join state machine into a "we have a squad" state.
+    /// `with_persistence` doesn't initialize the network task, so
+    /// `reconcile_group_room` runs against the local state alone — exactly
+    /// what we want to assert against.
+    fn vm_for_reconcile() -> VoiceManager {
+        VoiceManager::with_persistence(
+            DEFAULT_SERVER_URL,
+            VoiceSettings::default(),
+            HashSet::new(),
+        )
+    }
+
+    fn set_squad(vm: &mut VoiceManager, cluster: &str, members: u32) {
+        vm.rtapi_group_kind = GroupKind::Squad;
+        vm.rtapi_group_member_count = members as usize;
+        vm.last_cluster_id = Some(cluster.to_string());
+    }
+
+    fn set_party(vm: &mut VoiceManager, cluster: &str, members: u32) {
+        vm.rtapi_group_kind = GroupKind::Party;
+        vm.rtapi_group_member_count = members as usize;
+        vm.last_cluster_id = Some(cluster.to_string());
+    }
+
+    fn clear_group(vm: &mut VoiceManager) {
+        vm.rtapi_group_kind = GroupKind::None;
+        vm.rtapi_group_member_count = 0;
+        vm.last_cluster_id = None;
+    }
+
+    #[test]
+    fn reconcile_joins_squad_room_when_in_squad() {
+        let mut vm = vm_for_reconcile();
+        set_squad(&mut vm, "abc", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("squad:abc"));
+    }
+
+    #[test]
+    fn reconcile_joins_party_room_when_in_party() {
+        let mut vm = vm_for_reconcile();
+        set_party(&mut vm, "p1", 3);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("party:p1"));
+    }
+
+    #[test]
+    fn reconcile_leaves_when_group_disbands() {
+        let mut vm = vm_for_reconcile();
+        set_squad(&mut vm, "abc", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("squad:abc"));
+
+        clear_group(&mut vm);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room, None);
+    }
+
+    #[test]
+    fn reconcile_swaps_room_on_cluster_change() {
+        let mut vm = vm_for_reconcile();
+        set_squad(&mut vm, "old", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("squad:old"));
+
+        set_squad(&mut vm, "new", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("squad:new"));
+    }
+
+    #[test]
+    fn reconcile_respects_auto_join_disabled() {
+        let mut vm = vm_for_reconcile();
+        vm.settings.auto_join_group_rooms = false;
+        set_squad(&mut vm, "abc", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room, None);
+    }
+
+    #[test]
+    fn manual_leave_suppresses_rejoin_for_same_cluster() {
+        let mut vm = vm_for_reconcile();
+        set_squad(&mut vm, "abc", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("squad:abc"));
+
+        vm.leave_room_manual("squad:abc");
+        assert_eq!(vm.current_group_room, None);
+
+        // Reconcile while still squadded with the same cluster: stays out.
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room, None);
+    }
+
+    #[test]
+    fn fresh_cluster_lifts_suppression() {
+        let mut vm = vm_for_reconcile();
+        set_squad(&mut vm, "abc", 5);
+        vm.reconcile_group_room();
+        vm.leave_room_manual("squad:abc");
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room, None);
+
+        // Disband + reform under a different cluster id: auto-join resumes.
+        clear_group(&mut vm);
+        vm.reconcile_group_room();
+        set_squad(&mut vm, "xyz", 5);
+        vm.reconcile_group_room();
+        assert_eq!(vm.current_group_room.as_deref(), Some("squad:xyz"));
     }
 }

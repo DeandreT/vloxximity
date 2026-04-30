@@ -467,6 +467,15 @@ impl SettingsWindow {
 
                 ui.separator();
 
+                // Auto-join toggle. Off by user choice → group rooms behave
+                // like manual rooms (only the suggestion's Join button adds
+                // them).
+                let mut auto_join_group = new_settings.auto_join_group_rooms;
+                if ui.checkbox("Auto-join squad/party rooms", &mut auto_join_group) {
+                    new_settings.auto_join_group_rooms = auto_join_group;
+                    settings_changed = true;
+                }
+
                 // RTAPI-derived suggestions (server-clustered squad/party ids).
                 // Only shown when the local player is in a multi-member group
                 // and the server has issued a cluster id. Click-to-join hooks
@@ -630,6 +639,7 @@ impl SettingsWindow {
                 s.show_peer_markers = settings.show_peer_markers;
                 s.gw2_api_key = settings.gw2_api_key;
                 s.room_type_volumes = settings.room_type_volumes;
+                s.auto_join_group_rooms = settings.auto_join_group_rooms;
             });
             crate::voice::persist::save_settings(&voice_manager.settings());
 
