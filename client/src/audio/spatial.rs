@@ -130,7 +130,10 @@ impl SpatialState {
         } else {
             let (r, _u, f) = listener.relative_position(source_pos);
             let inv = 1.0 / distance;
-            (sanitize(r * inv).clamp(-1.0, 1.0), sanitize(f * inv).clamp(-1.0, 1.0))
+            (
+                sanitize(r * inv).clamp(-1.0, 1.0),
+                sanitize(f * inv).clamp(-1.0, 1.0),
+            )
         };
 
         // Equal-power pan from the `right` axis.
@@ -151,11 +154,7 @@ impl SpatialState {
         // ITD held constant across the frame. Contralateral ear is delayed.
         let itd = (right_unit.abs() * ITD_MAX_SAMPLES as f32).round() as usize;
         let itd = itd.min(ITD_MAX_SAMPLES);
-        let (itd_l, itd_r) = if right_unit > 0.0 {
-            (itd, 0)
-        } else {
-            (0, itd)
-        };
+        let (itd_l, itd_r) = if right_unit > 0.0 { (itd, 0) } else { (0, itd) };
         self.itd_samples_l = itd_l as u8;
         self.itd_samples_r = itd_r as u8;
 
@@ -213,7 +212,11 @@ impl Default for SpatialState {
 }
 
 fn sanitize(x: f32) -> f32 {
-    if x.is_finite() { x } else { 0.0 }
+    if x.is_finite() {
+        x
+    } else {
+        0.0
+    }
 }
 
 /// Centered mono: both ears receive the attenuated mono signal, no pan.
@@ -311,7 +314,13 @@ mod tests {
         for i in 16..FRAME_LEN {
             let l = out[2 * i];
             let r = out[2 * i + 1];
-            assert!((l - r).abs() < 1e-5, "L/R asymmetric at i={}: l={} r={}", i, l, r);
+            assert!(
+                (l - r).abs() < 1e-5,
+                "L/R asymmetric at i={}: l={} r={}",
+                i,
+                l,
+                r
+            );
         }
     }
 
@@ -331,7 +340,11 @@ mod tests {
         assert_eq!(state.itd_samples_r, 0);
 
         let peak_l = out.iter().step_by(2).fold(0.0f32, |a, &s| a.max(s.abs()));
-        let peak_r = out.iter().skip(1).step_by(2).fold(0.0f32, |a, &s| a.max(s.abs()));
+        let peak_r = out
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .fold(0.0f32, |a, &s| a.max(s.abs()));
         assert!(peak_r > 0.9, "right ear too quiet: {}", peak_r);
         assert!(peak_l < 1e-4, "left ear should be silent: {}", peak_l);
     }
@@ -436,7 +449,12 @@ mod tests {
         let around_l: f32 = (ITD_MAX_SAMPLES..ITD_MAX_SAMPLES + 8)
             .map(|i| out[2 * i].abs())
             .sum();
-        assert!(around_l > early_l, "impulse not delayed: early={} around={}", early_l, around_l);
+        assert!(
+            around_l > early_l,
+            "impulse not delayed: early={} around={}",
+            early_l,
+            around_l
+        );
 
         // Drive a second frame — must not blow up or produce non-finite.
         state.process_frame(&frame2, &listener, &source, &cfg, &mut out);

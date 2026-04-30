@@ -130,7 +130,11 @@ impl SignalingClient {
                                 let _ = evt_tx.send(server_msg);
                             }
                             Err(err) => {
-                                log::warn!("Failed to parse server message: {} -- err: {}", text, err);
+                                log::warn!(
+                                    "Failed to parse server message: {} -- err: {}",
+                                    text,
+                                    err
+                                );
                             }
                         }
                     }

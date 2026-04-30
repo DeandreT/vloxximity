@@ -180,7 +180,12 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Convert room event to server message, filtering by peer
 fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<OutgoingWsMessage> {
     match event {
-        RoomEvent::PeerJoined { room_id, peer_id, player_name, account_name } => {
+        RoomEvent::PeerJoined {
+            room_id,
+            peer_id,
+            player_name,
+            account_name,
+        } => {
             if peer_id == self_peer_id {
                 return None;
             }
@@ -199,19 +204,36 @@ fn room_event_to_message(event: RoomEvent, self_peer_id: &str) -> Option<Outgoin
             if peer_id == self_peer_id {
                 return None;
             }
-            Some(OutgoingWsMessage::Text(ServerMessage::PeerLeft { room_id, peer_id }))
+            Some(OutgoingWsMessage::Text(ServerMessage::PeerLeft {
+                room_id,
+                peer_id,
+            }))
         }
-        RoomEvent::PeerPosition { peer_id, position, front } => {
+        RoomEvent::PeerPosition {
+            peer_id,
+            position,
+            front,
+        } => {
             if peer_id == self_peer_id {
                 return None;
             }
-            Some(OutgoingWsMessage::Text(ServerMessage::PeerPosition { peer_id, position, front }))
+            Some(OutgoingWsMessage::Text(ServerMessage::PeerPosition {
+                peer_id,
+                position,
+                front,
+            }))
         }
-        RoomEvent::PeerAudio { room_id, peer_id, data } => {
+        RoomEvent::PeerAudio {
+            room_id,
+            peer_id,
+            data,
+        } => {
             if peer_id == self_peer_id {
                 return None;
             }
-            Some(OutgoingWsMessage::Binary(encode_server_audio_frame(&peer_id, &room_id, &data)))
+            Some(OutgoingWsMessage::Binary(encode_server_audio_frame(
+                &peer_id, &room_id, &data,
+            )))
         }
     }
 }
@@ -234,10 +256,17 @@ async fn handle_client_message(
     direct_tx: &mpsc::UnboundedSender<ServerMessage>,
 ) {
     match msg {
-        ClientMessage::JoinRoom { room_id, player_name, api_key } => {
+        ClientMessage::JoinRoom {
+            room_id,
+            player_name,
+            api_key,
+        } => {
             tracing::info!(
                 "Received JoinRoom from {} -> room={} player_name={} api_key={}",
-                peer_id, room_id, player_name, if api_key.is_some() { "yes" } else { "no" }
+                peer_id,
+                room_id,
+                player_name,
+                if api_key.is_some() { "yes" } else { "no" }
             );
             let account_name = match api_key.as_deref() {
                 Some(key) if !key.trim().is_empty() => {
@@ -254,14 +283,20 @@ async fn handle_client_message(
             });
 
             let Some(account_name) = account_name else {
-                let reason = if api_key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+                let reason = if api_key
+                    .as_deref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false)
+                {
                     "GW2 API key rejected — check the key and the 'account' permission"
                 } else {
                     "GW2 API key required to join rooms (set one in Vloxximity settings)"
                 };
                 tracing::info!(
                     "Rejecting JoinRoom from {} (room={}): {}",
-                    peer_id, room_id, reason
+                    peer_id,
+                    room_id,
+                    reason
                 );
                 let _ = direct_tx.send(ServerMessage::JoinRejected {
                     room_id: room_id.clone(),
@@ -270,12 +305,15 @@ async fn handle_client_message(
                 return;
             };
 
-            if let Err(AccountCapExceeded) =
-                state.rooms.try_set_account_name(peer_id, Some(account_name.clone()))
+            if let Err(AccountCapExceeded) = state
+                .rooms
+                .try_set_account_name(peer_id, Some(account_name.clone()))
             {
                 tracing::info!(
                     "Rejecting JoinRoom from {} (room={}): account {} at connection cap",
-                    peer_id, room_id, account_name
+                    peer_id,
+                    room_id,
+                    account_name
                 );
                 let _ = direct_tx.send(ServerMessage::JoinRejected {
                     room_id: room_id.clone(),
@@ -284,9 +322,7 @@ async fn handle_client_message(
                 return;
             }
 
-            if let Some(peers) =
-                state.rooms.join_room(peer_id, &room_id, &player_name)
-            {
+            if let Some(peers) = state.rooms.join_room(peer_id, &room_id, &player_name) {
                 let response = ServerMessage::RoomJoined {
                     room_id: room_id.clone(),
                     peers: peers.into_iter().map(Into::into).collect(),
@@ -305,7 +341,10 @@ async fn handle_client_message(
             } else {
                 crate::gw2::validate_api_key(&state.http, &state.gw2_cache, trimmed).await
             };
-            match state.rooms.try_set_account_name(peer_id, account_name.clone()) {
+            match state
+                .rooms
+                .try_set_account_name(peer_id, account_name.clone())
+            {
                 Ok(()) => {
                     let _ = direct_tx.send(ServerMessage::AccountValidated { account_name });
                 }
@@ -316,7 +355,8 @@ async fn handle_client_message(
                     if let Some(name) = account_name.as_ref() {
                         tracing::info!(
                             "ValidateApiKey from {} rejected: account {} at connection cap",
-                            peer_id, name
+                            peer_id,
+                            name
                         );
                     }
                     let _ = direct_tx.send(ServerMessage::AccountValidated { account_name: None });
@@ -341,10 +381,7 @@ async fn handle_client_message(
             // off account identity, and we want to be sure the requester
             // is actually one of the members they're listing.
             let Some(own_account) = state.rooms.peer_account_name(peer_id) else {
-                tracing::info!(
-                    "Dropping IdentifyGroup from {}: no bound account",
-                    peer_id
-                );
+                tracing::info!("Dropping IdentifyGroup from {}: no bound account", peer_id);
                 return;
             };
             // Sender must be in the report — protects against a peer
@@ -380,11 +417,7 @@ async fn handle_client_message(
                 deduped = keep;
             }
             let cluster_id = state.squads.identify(deduped);
-            tracing::info!(
-                "IdentifyGroup from {}: cluster={}",
-                peer_id,
-                cluster_id
-            );
+            tracing::info!("IdentifyGroup from {}: cluster={}", peer_id, cluster_id);
             let _ = direct_tx.send(ServerMessage::GroupIdentified { cluster_id });
         }
 
@@ -400,7 +433,11 @@ fn validate_message_lengths(peer_id: &str, msg: &ClientMessage) -> bool {
         if len > max {
             tracing::warn!(
                 "Dropping {} from {}: {} length {} > cap {}",
-                msg_kind(msg), peer_id, what, len, max
+                msg_kind(msg),
+                peer_id,
+                what,
+                len,
+                max
             );
             true
         } else {
@@ -408,11 +445,21 @@ fn validate_message_lengths(peer_id: &str, msg: &ClientMessage) -> bool {
         }
     };
     match msg {
-        ClientMessage::JoinRoom { room_id, player_name, api_key } => {
-            if too_long("room_id", room_id.len(), MAX_ROOM_ID_LEN) { return false; }
-            if too_long("player_name", player_name.len(), MAX_PLAYER_NAME_LEN) { return false; }
+        ClientMessage::JoinRoom {
+            room_id,
+            player_name,
+            api_key,
+        } => {
+            if too_long("room_id", room_id.len(), MAX_ROOM_ID_LEN) {
+                return false;
+            }
+            if too_long("player_name", player_name.len(), MAX_PLAYER_NAME_LEN) {
+                return false;
+            }
             if let Some(key) = api_key {
-                if too_long("api_key", key.len(), MAX_API_KEY_LEN) { return false; }
+                if too_long("api_key", key.len(), MAX_API_KEY_LEN) {
+                    return false;
+                }
             }
             true
         }
@@ -478,11 +525,19 @@ mod tests {
 
     #[test]
     fn length_caps_pass_normal_messages() {
-        assert!(validate_message_lengths("p", &join_room("room", "Alice", Some("k"))));
-        assert!(validate_message_lengths("p", &join_room("room", "Alice", None)));
         assert!(validate_message_lengths(
             "p",
-            &ClientMessage::ValidateApiKey { api_key: "k".to_string() }
+            &join_room("room", "Alice", Some("k"))
+        ));
+        assert!(validate_message_lengths(
+            "p",
+            &join_room("room", "Alice", None)
+        ));
+        assert!(validate_message_lengths(
+            "p",
+            &ClientMessage::ValidateApiKey {
+                api_key: "k".to_string()
+            }
         ));
         assert!(validate_message_lengths(
             "p",
@@ -494,13 +549,19 @@ mod tests {
     #[test]
     fn length_caps_reject_oversize_room_id() {
         let too_long = "x".repeat(MAX_ROOM_ID_LEN + 1);
-        assert!(!validate_message_lengths("p", &join_room(&too_long, "A", None)));
+        assert!(!validate_message_lengths(
+            "p",
+            &join_room(&too_long, "A", None)
+        ));
     }
 
     #[test]
     fn length_caps_reject_oversize_player_name() {
         let too_long = "x".repeat(MAX_PLAYER_NAME_LEN + 1);
-        assert!(!validate_message_lengths("p", &join_room("r", &too_long, None)));
+        assert!(!validate_message_lengths(
+            "p",
+            &join_room("r", &too_long, None)
+        ));
     }
 
     #[test]
@@ -536,9 +597,17 @@ mod tests {
         // JoinRoom bucket has burst=8; the 9th call within the same
         // instant must be rejected.
         for _ in 0..8 {
-            assert!(apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+            assert!(apply_rate_limit(
+                "p",
+                &join_room("r", "A", None),
+                &mut rates
+            ));
         }
-        assert!(!apply_rate_limit("p", &join_room("r", "A", None), &mut rates));
+        assert!(!apply_rate_limit(
+            "p",
+            &join_room("r", "A", None),
+            &mut rates
+        ));
         // LeaveRoom and Ping bypass the buckets — they should still pass.
         assert!(apply_rate_limit(
             "p",

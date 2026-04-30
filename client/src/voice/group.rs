@@ -6,8 +6,8 @@
 //! clustering. Group *shape* (`None` / `Party` / `Squad`) comes from the
 //! polled RTAPI group snapshot in the manager update loop.
 
-use std::collections::HashMap;
 use nexus::rtapi::GroupType;
+use std::collections::HashMap;
 
 /// Subset of `nexus::rtapi::GroupMember` we keep — only the fields the
 /// suggestion logic needs. Storing owned strings (vs the FFI struct's
@@ -52,9 +52,7 @@ impl GroupKind {
 pub enum GroupMemberEvent {
     Joined(GroupMemberSnapshot),
     Updated(GroupMemberSnapshot),
-    Left {
-        account_name: String,
-    },
+    Left { account_name: String },
 }
 
 /// Local mirror of the player's RTAPI group. Keyed by account name.
@@ -81,10 +79,7 @@ impl GroupState {
                         // Updates that don't change anything we care about
                         // shouldn't trigger a re-identify. Only return
                         // true when the relevant fields differ.
-                        let new = self
-                            .members
-                            .get(&old.account_name)
-                            .expect("just inserted");
+                        let new = self.members.get(&old.account_name).expect("just inserted");
                         old.subgroup != new.subgroup
                             || old.is_commander != new.is_commander
                             || old.character_name != new.character_name
@@ -92,9 +87,7 @@ impl GroupState {
                     None => true,
                 }
             }
-            GroupMemberEvent::Left { account_name } => {
-                self.members.remove(&account_name).is_some()
-            }
+            GroupMemberEvent::Left { account_name } => self.members.remove(&account_name).is_some(),
         }
     }
 
@@ -150,7 +143,9 @@ mod tests {
         assert!(g.apply(GroupMemberEvent::Joined(snap("A.1", 1, true, true))));
         assert_eq!(g.member_count(), 1);
         assert_eq!(g.commander_name(), Some("A.1"));
-        assert!(g.apply(GroupMemberEvent::Left { account_name: "A.1".into() }));
+        assert!(g.apply(GroupMemberEvent::Left {
+            account_name: "A.1".into()
+        }));
         assert_eq!(g.member_count(), 0);
         assert_eq!(g.commander_name(), None);
     }
@@ -159,8 +154,12 @@ mod tests {
     fn duplicate_left_returns_false() {
         let mut g = GroupState::new();
         let _ = g.apply(GroupMemberEvent::Joined(snap("A.1", 1, true, false)));
-        assert!(g.apply(GroupMemberEvent::Left { account_name: "A.1".into() }));
-        assert!(!g.apply(GroupMemberEvent::Left { account_name: "A.1".into() }));
+        assert!(g.apply(GroupMemberEvent::Left {
+            account_name: "A.1".into()
+        }));
+        assert!(!g.apply(GroupMemberEvent::Left {
+            account_name: "A.1".into()
+        }));
     }
 
     #[test]
@@ -206,7 +205,10 @@ mod tests {
     #[test]
     fn rtapi_squads_map_to_squad() {
         assert_eq!(GroupKind::from_rtapi(GroupType::Squad, 1), GroupKind::Squad);
-        assert_eq!(GroupKind::from_rtapi(GroupType::RaidSquad, 1), GroupKind::Squad);
+        assert_eq!(
+            GroupKind::from_rtapi(GroupType::RaidSquad, 1),
+            GroupKind::Squad
+        );
     }
 
     #[test]

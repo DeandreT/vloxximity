@@ -6,10 +6,10 @@
 
 pub mod audio;
 pub mod network;
+mod nexus_logger;
 pub mod position;
 pub mod ui;
 pub mod voice;
-mod nexus_logger;
 
 use nexus::event::event_consume;
 use nexus::gui::{register_render, render, RenderType};
@@ -80,7 +80,11 @@ fn addon_load() {
         log::warn!("Failed to initialize Nexus logger: {}", e);
     }
 
-    log(LogLevel::Info, "Vloxximity", format!("Vloxximity {} loading...", VERSION));
+    log(
+        LogLevel::Info,
+        "Vloxximity",
+        format!("Vloxximity {} loading...", VERSION),
+    );
 
     // Initialize addon state
     match AddonState::new() {
@@ -89,7 +93,11 @@ fn addon_load() {
             {
                 let mut vm = state.voice_manager.write();
                 if let Err(e) = vm.init() {
-                    log(LogLevel::Warning, "Vloxximity", format!("Failed to initialize voice manager: {}", e));
+                    log(
+                        LogLevel::Warning,
+                        "Vloxximity",
+                        format!("Failed to initialize voice manager: {}", e),
+                    );
                 }
             }
 
@@ -106,12 +114,10 @@ fn addon_load() {
             // routing strictly into that room type and override the
             // default when held.
             let ptt_handler = keybind_handler!(handle_ptt);
-            register_keybind_with_string("Push To Talk", ptt_handler, "")
-                .revert_on_unload();
+            register_keybind_with_string("Push To Talk", ptt_handler, "").revert_on_unload();
 
             let map_handler = keybind_handler!(handle_ptt_per_type);
-            register_keybind_with_string("Push To Talk (Map)", map_handler, "")
-                .revert_on_unload();
+            register_keybind_with_string("Push To Talk (Map)", map_handler, "").revert_on_unload();
             let squad_handler = keybind_handler!(handle_ptt_per_type);
             register_keybind_with_string("Push To Talk (Squad)", squad_handler, "")
                 .revert_on_unload();
@@ -150,10 +156,18 @@ fn addon_load() {
                 }))
                 .revert_on_unload();
 
-            log(LogLevel::Info, "Vloxximity", "Vloxximity loaded successfully");
+            log(
+                LogLevel::Info,
+                "Vloxximity",
+                "Vloxximity loaded successfully",
+            );
         }
         Err(e) => {
-            log(LogLevel::Critical, "Vloxximity", format!("Failed to initialize Vloxximity: {}", e));
+            log(
+                LogLevel::Critical,
+                "Vloxximity",
+                format!("Failed to initialize Vloxximity: {}", e),
+            );
         }
     }
 }
@@ -189,7 +203,11 @@ fn render_main(ui: &Ui) {
                 .map(|t| now.duration_since(*t).as_secs() > 5)
                 .unwrap_or(true)
             {
-                log(LogLevel::Warning, "Vloxximity", format!("Voice update error: {}", e));
+                log(
+                    LogLevel::Warning,
+                    "Vloxximity",
+                    format!("Voice update error: {}", e),
+                );
                 let _ = LAST_ERROR.set(now);
             }
         }

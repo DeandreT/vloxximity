@@ -38,11 +38,7 @@ impl AudioPlayback {
     pub fn list_devices(&self) -> Vec<String> {
         self.host
             .output_devices()
-            .map(|devices| {
-                devices
-                    .filter_map(|d| d.name().ok())
-                    .collect()
-            })
+            .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
             .unwrap_or_default()
     }
 

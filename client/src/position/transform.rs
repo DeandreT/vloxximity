@@ -89,8 +89,8 @@ impl Position {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Transform {
     pub position: Position,
-    pub front: Position,  // Forward direction
-    pub top: Position,    // Up direction
+    pub front: Position, // Forward direction
+    pub top: Position,   // Up direction
 }
 
 impl Default for Transform {
@@ -141,7 +141,12 @@ impl Transform {
     }
 
     /// Convert a listener-local offset `(right, up, front)` into world space.
-    pub fn local_offset_to_world(&self, right_offset: f32, up_offset: f32, front_offset: f32) -> Position {
+    pub fn local_offset_to_world(
+        &self,
+        right_offset: f32,
+        up_offset: f32,
+        front_offset: f32,
+    ) -> Position {
         let (right, up, front) = self.basis();
 
         Position::new(

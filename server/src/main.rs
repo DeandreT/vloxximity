@@ -13,11 +13,7 @@ mod sweeper;
 mod test_peer;
 
 use axum::{
-    extract::ws::WebSocketUpgrade,
-    extract::State,
-    response::IntoResponse,
-    routing::get,
-    Router,
+    extract::ws::WebSocketUpgrade, extract::State, response::IntoResponse, routing::get, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use std::net::SocketAddr;
@@ -141,12 +137,12 @@ fn parse_test_peer_flag<I: IntoIterator<Item = String>>(args: I) -> Option<TestP
             if rest.is_empty() {
                 // Allow `--testpeer <mode>` as a follow-on argument.
                 return match iter.next() {
-                    Some(next) if !next.starts_with("--") => Some(
-                        TestPeerMode::parse(&next).unwrap_or_else(|| {
+                    Some(next) if !next.starts_with("--") => {
+                        Some(TestPeerMode::parse(&next).unwrap_or_else(|| {
                             tracing::warn!("Unknown test peer mode '{}', using orbit", next);
                             TestPeerMode::Orbit
-                        }),
-                    ),
+                        }))
+                    }
                     _ => Some(TestPeerMode::Orbit),
                 };
             } else if let Some(mode_str) = rest.strip_prefix('=') {

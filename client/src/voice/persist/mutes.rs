@@ -36,13 +36,21 @@ pub fn load_muted_accounts() -> HashSet<String> {
                 file.accounts.into_iter().collect()
             }
             Err(e) => {
-                log::warn!("Failed to parse {}: {} — starting with empty mute list", path.display(), e);
+                log::warn!(
+                    "Failed to parse {}: {} — starting with empty mute list",
+                    path.display(),
+                    e
+                );
                 HashSet::new()
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
         Err(e) => {
-            log::warn!("Failed to read {}: {} — starting with empty mute list", path.display(), e);
+            log::warn!(
+                "Failed to read {}: {} — starting with empty mute list",
+                path.display(),
+                e
+            );
             HashSet::new()
         }
     }

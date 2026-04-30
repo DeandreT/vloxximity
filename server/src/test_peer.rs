@@ -150,18 +150,16 @@ async fn supervisor(rooms: Arc<RoomManager>, mode: TestPeerMode) {
 
         let to_remove: Vec<String> = active
             .iter()
-            .filter(|(room_id, peers)| {
-                match snapshots.iter().find(|(r, _)| r == *room_id) {
+            .filter(
+                |(room_id, peers)| match snapshots.iter().find(|(r, _)| r == *room_id) {
                     None => true,
                     Some((_, occupants)) => {
                         let fake_ids: Vec<&str> =
                             peers.iter().map(|p| p.peer_id.as_str()).collect();
-                        occupants
-                            .iter()
-                            .all(|occ| fake_ids.contains(&occ.as_str()))
+                        occupants.iter().all(|occ| fake_ids.contains(&occ.as_str()))
                     }
-                }
-            })
+                },
+            )
             .map(|(r, _)| r.clone())
             .collect();
 
@@ -262,8 +260,7 @@ async fn run_peer(
                     .map(|s| s.position)
             });
 
-        let target_valid = target_pos_opt
-            .filter(|p| p.x != 0.0 || p.y != 0.0 || p.z != 0.0);
+        let target_valid = target_pos_opt.filter(|p| p.x != 0.0 || p.y != 0.0 || p.z != 0.0);
 
         let computed: Option<(Position, Position)> = match spec.motion {
             Motion::Orbit { radius, period } => target_valid.map(|center| {
@@ -294,7 +291,9 @@ async fn run_peer(
 
         // Lazy room join: only once we have a position to publish.
         if !joined {
-            let Some((pos, front)) = computed else { continue };
+            let Some((pos, front)) = computed else {
+                continue;
+            };
             // Stamp position before joining so it's on record the moment the
             // room broadcasts PeerJoined.
             rooms.update_position(&peer_id, pos, front);
@@ -325,7 +324,9 @@ async fn run_peer(
         }
 
         for sample in pcm.iter_mut() {
-            rng_state = rng_state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            rng_state = rng_state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
             let dither = ((rng_state >> 16) as i16 as f32) / i16::MAX as f32 * DITHER_AMPLITUDE;
             let s = (phase.sin() * TONE_AMPLITUDE) + dither;
             *sample = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;

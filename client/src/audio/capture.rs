@@ -42,11 +42,7 @@ impl AudioCapture {
     pub fn list_devices(&self) -> Vec<String> {
         self.host
             .input_devices()
-            .map(|devices| {
-                devices
-                    .filter_map(|d| d.name().ok())
-                    .collect()
-            })
+            .map(|devices| devices.filter_map(|d| d.name().ok()).collect())
             .unwrap_or_default()
     }
 

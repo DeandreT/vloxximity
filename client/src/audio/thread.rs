@@ -4,10 +4,10 @@
 //! requires staying on the thread where it was created.
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 

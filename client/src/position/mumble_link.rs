@@ -269,7 +269,10 @@ fn parse_identity(identity: &[u16; 256]) -> Option<PlayerIdentity> {
                 }
             }
 
-            log::trace!("Failed to extract name from identity JSON: {}", identity_str);
+            log::trace!(
+                "Failed to extract name from identity JSON: {}",
+                identity_str
+            );
             None
         }
     }

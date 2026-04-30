@@ -1,8 +1,8 @@
 //! ImGui settings window for Vloxximity.
 
-use crate::voice::{VoiceManager, VoiceMode, VoiceSettings};
 use crate::voice::manager::ApiKeyStatus;
 use crate::voice::room_type::RoomType;
+use crate::voice::{VoiceManager, VoiceMode, VoiceSettings};
 use nexus::imgui::{Condition, InputTextFlags, Selectable, Slider, TreeNodeFlags, Ui, Window};
 
 /// Settings window state
@@ -251,11 +251,7 @@ impl SettingsWindow {
 
                     ui.spacing();
                     ui.text_disabled("Per-room-type volumes (multiplied with output)");
-                    let types = [
-                        RoomType::Map,
-                        RoomType::Squad,
-                        RoomType::Party,
-                    ];
+                    let types = [RoomType::Map, RoomType::Squad, RoomType::Party];
                     for ty in types {
                         let mut v = new_settings.room_type_volumes.get(ty);
                         let label = format!("{}##room_vol", ty.label());
@@ -283,7 +279,8 @@ impl SettingsWindow {
                     ui.text_disabled("Full volume within this range");
 
                     let mut max_dist = new_settings.max_distance;
-                    if Slider::new("Max Distance", 1000.0f32, 100000.0f32).build(ui, &mut max_dist) {
+                    if Slider::new("Max Distance", 1000.0f32, 100000.0f32).build(ui, &mut max_dist)
+                    {
                         new_settings.max_distance = max_dist;
                         settings_changed = true;
                     }
@@ -402,16 +399,10 @@ impl SettingsWindow {
                                 );
                             }
                             (true, ApiKeyStatus::Invalid { message }) => {
-                                ui.text_colored(
-                                    color_red,
-                                    format!("[!] Rejected — {}", message),
-                                );
+                                ui.text_colored(color_red, format!("[!] Rejected — {}", message));
                             }
                             (true, ApiKeyStatus::Validating) => {
-                                ui.text_colored(
-                                    color_yellow,
-                                    "[...] Validating with server...",
-                                );
+                                ui.text_colored(color_yellow, "[...] Validating with server...");
                             }
                             _ => {
                                 ui.text_disabled(
@@ -493,7 +484,10 @@ impl SettingsWindow {
                             crate::voice::GroupKind::None => "Group",
                         };
                         let label_lead = match suggestions.commander_account_name.as_deref() {
-                            Some(name) => format!("{}: {} ({} members)", room_label, name, suggestions.member_count),
+                            Some(name) => format!(
+                                "{}: {} ({} members)",
+                                room_label, name, suggestions.member_count
+                            ),
                             None => format!("{}: {} members", room_label, suggestions.member_count),
                         };
                         ui.text(format!("{} → {}", label_lead, suggestions.room_id));
@@ -544,10 +538,8 @@ impl SettingsWindow {
                         if id.is_empty() {
                             self.join_room_error = Some("Enter a room id first".to_string());
                         } else if RoomType::from_room_id(&id).is_none() {
-                            self.join_room_error = Some(
-                                "Room id must start with map:, squad:, or party:"
-                                    .to_string(),
-                            );
+                            self.join_room_error =
+                                Some("Room id must start with map:, squad:, or party:".to_string());
                         } else {
                             self.pending_join_room = Some(id);
                             self.join_room_buffer.clear();
@@ -599,7 +591,6 @@ impl SettingsWindow {
                         }
                     }
                 }
-
             });
 
         // Store new settings if changed (will be applied by caller)

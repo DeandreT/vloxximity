@@ -432,7 +432,9 @@ impl RoomManager {
     /// deduplicated automatically because each peer has a single tx channel.
     pub fn update_position(&self, peer_id: &str, position: Position, front: Position) {
         let sender_rooms: HashSet<String> = {
-            let Some(mut peer) = self.peers.get_mut(peer_id) else { return };
+            let Some(mut peer) = self.peers.get_mut(peer_id) else {
+                return;
+            };
             peer.position = position;
             peer.front = front;
             peer.last_update = Instant::now();
@@ -531,7 +533,12 @@ impl RoomManager {
         self.rooms
             .iter()
             .map(|entry| {
-                let peer_ids = entry.value().peers.iter().map(|p| p.key().clone()).collect();
+                let peer_ids = entry
+                    .value()
+                    .peers
+                    .iter()
+                    .map(|p| p.key().clone())
+                    .collect();
                 (entry.key().clone(), peer_ids)
             })
             .collect()
@@ -728,7 +735,9 @@ mod tests {
             RoomEvent::PeerAudio { room_id, .. } if room_id == "map:A"
         )));
         assert!(
-            !carol_evs.iter().any(|e| matches!(e, RoomEvent::PeerAudio { .. })),
+            !carol_evs
+                .iter()
+                .any(|e| matches!(e, RoomEvent::PeerAudio { .. })),
             "carol is in squad:B only and must not receive map:A audio"
         );
     }
@@ -779,7 +788,10 @@ mod tests {
             .into_iter()
             .filter(|e| matches!(e, RoomEvent::PeerPosition { .. }))
             .count();
-        assert_eq!(position_count, 1, "Bob should receive exactly one position update");
+        assert_eq!(
+            position_count, 1,
+            "Bob should receive exactly one position update"
+        );
     }
 
     #[test]

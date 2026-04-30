@@ -21,9 +21,7 @@ pub enum ClientMessage {
     },
     /// Ask the server to validate a GW2 API key without joining a room.
     /// Server replies with `AccountValidated`.
-    ValidateApiKey {
-        api_key: String,
-    },
+    ValidateApiKey { api_key: String },
     /// Leave a single room (when `room_id` is `Some`) or every room the peer
     /// is in (when `None`, used at logout / re-auth / disconnect).
     LeaveRoom {
@@ -32,17 +30,12 @@ pub enum ClientMessage {
     },
     /// Update player position. Position is peer-global (world coordinates),
     /// not per-room.
-    UpdatePosition {
-        position: Position,
-        front: Position,
-    },
+    UpdatePosition { position: Position, front: Position },
     /// Tell the server which GW2 group we're in (account names of every
     /// member, including ourselves). The server clusters overlapping
     /// reports and replies with a stable `cluster_id` we can use as a
     /// `squad:` or `party:` room id.
-    IdentifyGroup {
-        members: Vec<String>,
-    },
+    IdentifyGroup { members: Vec<String> },
     /// Heartbeat/keepalive
     Ping,
 }
@@ -52,9 +45,7 @@ pub enum ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// Connection established, assigned peer ID
-    Welcome {
-        peer_id: String,
-    },
+    Welcome { peer_id: String },
     /// Server-validated GW2 account handle for the local peer. `None`
     /// when the user didn't supply an API key or validation failed.
     /// Sent once per JoinRoom, just before the matching `RoomJoined`.
@@ -70,21 +61,12 @@ pub enum ServerMessage {
     /// JoinRoom rejected by the server (missing/invalid API key, etc.).
     /// Carries `room_id` so the client knows which join failed when several
     /// are in flight.
-    JoinRejected {
-        room_id: String,
-        reason: String,
-    },
+    JoinRejected { room_id: String, reason: String },
     /// A peer joined a specific room
-    PeerJoined {
-        room_id: String,
-        peer: PeerInfo,
-    },
+    PeerJoined { room_id: String, peer: PeerInfo },
     /// A peer left a specific room (the peer may still be in other rooms
     /// the local client shares with them).
-    PeerLeft {
-        room_id: String,
-        peer_id: String,
-    },
+    PeerLeft { room_id: String, peer_id: String },
     /// Peer position update — peer-global, not per-room.
     PeerPosition {
         peer_id: String,
@@ -98,19 +80,13 @@ pub enum ServerMessage {
         data: Vec<u8>,
     },
     /// Error message
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// Server is closing this connection. Reasons include the dead-connection
     /// sweeper firing on an idle session.
-    Kicked {
-        reason: String,
-    },
+    Kicked { reason: String },
     /// Reply to `IdentifyGroup`. The client wraps `cluster_id` as a
     /// `squad:` or `party:` room id based on its local RTAPI group shape.
-    GroupIdentified {
-        cluster_id: String,
-    },
+    GroupIdentified { cluster_id: String },
     /// Heartbeat response
     Pong,
 }
