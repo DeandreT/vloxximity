@@ -1,4 +1,9 @@
 //! `settings.json` plus OS-keyring storage for the GW2 API key.
+//!
+//! On native Windows the API key lives in the OS Credential Manager. Under
+//! Wine/Proton the in-prefix Credential Manager doesn't reliably persist
+//! credentials across sessions, so we detect Wine at runtime and fall back
+//! to a plaintext file in the addon dir.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -6,6 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::voice::manager::VoiceSettings;
 
 const SETTINGS_FILE: &str = "settings.json";
+const API_KEY_FILE: &str = "api_key.txt";
 const KEYRING_SERVICE: &str = "Vloxximity";
 const KEYRING_API_KEY: &str = "gw2-api-key";
 
@@ -20,6 +26,53 @@ struct LegacySettings {
 
 fn settings_path() -> Option<PathBuf> {
     Some(super::addon_dir()?.join(SETTINGS_FILE))
+}
+
+#[cfg(windows)]
+fn api_key_file_path() -> Option<PathBuf> {
+    Some(super::addon_dir()?.join(API_KEY_FILE))
+}
+
+/// True when this DLL is running inside a Wine / Proton prefix. Detected
+/// via the Wine-specific `wine_get_version` export from ntdll, which the
+/// real Microsoft ntdll never exports. Cached for the process lifetime.
+#[cfg(windows)]
+fn is_wine() -> bool {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    type HMODULE = *mut c_void;
+    type FARPROC = *const c_void;
+
+    extern "system" {
+        fn GetModuleHandleA(name: *const c_char) -> HMODULE;
+        fn GetProcAddress(module: HMODULE, name: *const c_char) -> FARPROC;
+    }
+
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| unsafe {
+        let ntdll = match CString::new("ntdll.dll") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let module = GetModuleHandleA(ntdll.as_ptr());
+        if module.is_null() {
+            return false;
+        }
+        let probe = match CString::new("wine_get_version") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let detected = !GetProcAddress(module, probe.as_ptr()).is_null();
+        if detected {
+            log::info!(
+                "Detected Wine/Proton — API key will persist to api_key.txt \
+                 in the addon dir instead of the OS keyring"
+            );
+        }
+        detected
+    })
 }
 
 /// Load `VoiceSettings` from `settings.json`, falling back to `Default` on
@@ -99,6 +152,9 @@ fn save_settings_inner(settings: &VoiceSettings, path: &Path) {
 
 #[cfg(windows)]
 fn read_api_key_from_keyring() -> String {
+    if is_wine() {
+        return read_api_key_from_file();
+    }
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_API_KEY) {
         Ok(entry) => match entry.get_password() {
             Ok(secret) => secret,
@@ -117,6 +173,10 @@ fn read_api_key_from_keyring() -> String {
 
 #[cfg(windows)]
 fn write_api_key_to_keyring(key: &str) {
+    if is_wine() {
+        write_api_key_to_file(key);
+        return;
+    }
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_API_KEY) {
         Ok(entry) => {
             if let Err(e) = entry.set_password(key) {
@@ -129,6 +189,10 @@ fn write_api_key_to_keyring(key: &str) {
 
 #[cfg(windows)]
 fn delete_api_key_from_keyring() {
+    if is_wine() {
+        delete_api_key_from_file();
+        return;
+    }
     match keyring::Entry::new(KEYRING_SERVICE, KEYRING_API_KEY) {
         Ok(entry) => match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -138,11 +202,53 @@ fn delete_api_key_from_keyring() {
     }
 }
 
+/// Read the API key from the Wine fallback file. Used on Wine where the
+/// in-prefix Credential Manager doesn't persist credentials across
+/// process lifetimes. On real Windows this is never reached.
+#[cfg(windows)]
+fn read_api_key_from_file() -> String {
+    let Some(path) = api_key_file_path() else {
+        return String::new();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            log::warn!("Failed to read API key from {}: {}", path.display(), e);
+            String::new()
+        }
+    }
+}
+
+#[cfg(windows)]
+fn write_api_key_to_file(key: &str) {
+    let Some(path) = api_key_file_path() else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&path, key) {
+        log::warn!("Failed to write API key to {}: {}", path.display(), e);
+    }
+}
+
+#[cfg(windows)]
+fn delete_api_key_from_file() {
+    let Some(path) = api_key_file_path() else {
+        return;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("Failed to delete {}: {}", path.display(), e),
+    }
+}
+
 // Non-Windows builds (host-side tests on Linux/macOS) have no keyring
 // dependency. The functions become no-ops; the `gw2_api_key` field still
 // exists in `VoiceSettings`, but it's not persisted anywhere.
 #[cfg(not(windows))]
-fn read_api_key_from_keyring() -> String { String::new() }
+fn read_api_key_from_keyring() -> String {
+    String::new()
+}
 #[cfg(not(windows))]
 fn write_api_key_to_keyring(_key: &str) {}
 #[cfg(not(windows))]
