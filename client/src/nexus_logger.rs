@@ -48,7 +48,7 @@ pub fn init() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
 
-fn log_channel(record: &Record) -> &str {
+fn log_channel<'a>(record: &Record<'a>) -> &'a str {
     if cfg!(debug_assertions) && !record.target().is_empty() {
         record.target()
     } else {
