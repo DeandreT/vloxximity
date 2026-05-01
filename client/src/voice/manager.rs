@@ -93,6 +93,46 @@ pub struct VoiceSettings {
     /// squad/party. The map room is always auto-managed off MumbleLink.
     #[serde(default = "default_true")]
     pub auto_join_group_rooms: bool,
+    #[serde(default)]
+    pub speaking_indicator: SpeakingIndicatorSettings,
+}
+
+/// Customisation for the floating "who is speaking" overlay. Defaults
+/// preserve the legacy top-right pill behaviour so existing users don't
+/// see a sudden change after upgrading.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpeakingIndicatorSettings {
+    pub enabled: bool,
+    /// When true, the overlay stays visible even with no active speakers
+    /// so the user can right-click it to tweak settings or drag it.
+    pub show_when_silent: bool,
+    /// When true, the overlay sticks to its configured position.
+    pub locked: bool,
+    /// User-chosen screen position. `None` falls back to the auto-placed
+    /// top-right corner.
+    pub position: Option<[f32; 2]>,
+    pub show_mute_buttons: bool,
+    pub show_coordinates: bool,
+    pub show_account_names: bool,
+    pub max_visible: u32,
+    pub bg_alpha: f32,
+}
+
+impl Default for SpeakingIndicatorSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            show_when_silent: false,
+            locked: true,
+            position: None,
+            show_mute_buttons: false,
+            show_coordinates: false,
+            show_account_names: false,
+            max_visible: 5,
+            bg_alpha: 0.7,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -117,6 +157,7 @@ impl Default for VoiceSettings {
             gw2_api_key: String::new(),
             room_type_volumes: RoomTypeVolumes::default(),
             auto_join_group_rooms: true,
+            speaking_indicator: SpeakingIndicatorSettings::default(),
         }
     }
 }
