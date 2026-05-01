@@ -13,7 +13,7 @@ pub mod voice;
 
 use nexus::event::event_consume;
 use nexus::gui::{register_render, render, RenderType};
-use nexus::imgui::{Condition, Ui, Window};
+use nexus::imgui::Ui;
 use nexus::keybind::{keybind_handler, register_keybind_with_string};
 use nexus::log::{log, LogLevel};
 use nexus::rtapi::event::{
@@ -24,7 +24,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use ui::SettingsWindow;
+use ui::{SettingsWindow, SpeakingIndicator};
 use voice::{GroupMemberEvent, GroupMemberSnapshot, RoomType, VoiceManager};
 
 /// Addon version
@@ -37,6 +37,7 @@ static ADDON_STATE: OnceCell<AddonState> = OnceCell::new();
 struct AddonState {
     voice_manager: Arc<RwLock<VoiceManager>>,
     settings_window: Arc<RwLock<SettingsWindow>>,
+    speaking_indicator: Arc<RwLock<SpeakingIndicator>>,
 }
 
 impl AddonState {
@@ -54,10 +55,12 @@ impl AddonState {
             muted_accounts,
         )));
         let settings_window = Arc::new(RwLock::new(SettingsWindow::new()));
+        let speaking_indicator = Arc::new(RwLock::new(SpeakingIndicator::new()));
 
         Ok(Self {
             voice_manager,
             settings_window,
+            speaking_indicator,
         })
     }
 
@@ -227,11 +230,19 @@ fn render_main(ui: &Ui) {
         }
     }
 
-    // Render speaking indicator overlay
+    // Render speaking indicator overlay (and apply any mutes / position
+    // changes the user clicked while inside the overlay).
     {
-        let vm = state.voice_manager.read();
-        render_speaking_indicator(ui, &vm);
-        render_peer_markers(ui, &vm);
+        let mut indicator = state.speaking_indicator.write();
+        {
+            let vm = state.voice_manager.read();
+            indicator.render(ui, &vm);
+            render_peer_markers(ui, &vm);
+        }
+        {
+            let mut vm = state.voice_manager.write();
+            indicator.apply_pending(&mut vm);
+        }
     }
 }
 
@@ -297,37 +308,6 @@ fn render_options(ui: &Ui) {
         drop(vm);
         state.settings_window.write().open();
     }
-}
-
-/// Render speaking indicator overlay
-fn render_speaking_indicator(ui: &Ui, voice_manager: &VoiceManager) {
-    let peers = voice_manager.get_peers();
-    let speaking_peers: Vec<_> = peers.into_iter().filter(|p| p.is_speaking).collect();
-
-    if speaking_peers.is_empty() {
-        return;
-    }
-
-    // Draw speaking indicators in corner
-    let display_size = ui.io().display_size;
-    let window_pos = [display_size[0] - 210.0, 10.0];
-
-    Window::new("##vloxximity_speaking")
-        .position(window_pos, Condition::Always)
-        .size([200.0, 100.0], Condition::FirstUseEver)
-        .no_decoration()
-        .always_auto_resize(true)
-        .no_inputs()
-        .bg_alpha(0.7)
-        .build(ui, || {
-            for peer in speaking_peers.iter().take(5) {
-                ui.text(format!("[*] {}", peer.player_name));
-            }
-
-            if speaking_peers.len() > 5 {
-                ui.text(format!("... and {} more", speaking_peers.len() - 5));
-            }
-        });
 }
 
 /// Handle the default PTT keybind ("Push To Talk").

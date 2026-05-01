@@ -332,6 +332,29 @@ mod tests {
     }
 
     #[test]
+    fn settings_roundtrip_preserves_speaking_indicator() {
+        let mut original = VoiceSettings::default();
+        original.speaking_indicator.enabled = false;
+        original.speaking_indicator.locked = false;
+        original.speaking_indicator.position = Some([123.5, 456.5]);
+        original.speaking_indicator.show_mute_buttons = true;
+        original.speaking_indicator.show_coordinates = true;
+        original.speaking_indicator.show_account_names = true;
+        original.speaking_indicator.max_visible = 12;
+        original.speaking_indicator.bg_alpha = 0.42;
+
+        let restored = roundtrip_settings(&original);
+        assert!(!restored.speaking_indicator.enabled);
+        assert!(!restored.speaking_indicator.locked);
+        assert_eq!(restored.speaking_indicator.position, Some([123.5, 456.5]));
+        assert!(restored.speaking_indicator.show_mute_buttons);
+        assert!(restored.speaking_indicator.show_coordinates);
+        assert!(restored.speaking_indicator.show_account_names);
+        assert_eq!(restored.speaking_indicator.max_visible, 12);
+        assert!((restored.speaking_indicator.bg_alpha - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
     fn settings_roundtrip_preserves_room_type_volumes() {
         let mut original = VoiceSettings::default();
         original.room_type_volumes.set(RoomType::Map, 0.4);

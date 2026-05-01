@@ -319,6 +319,27 @@ impl SettingsWindow {
 
                 ui.separator();
 
+                // Speaking indicator overlay — only the always-relevant
+                // toggles live here. The rest (lock, mute buttons,
+                // coordinates, account names, max visible, alpha, reset
+                // position) are accessible via right-click on the overlay
+                // itself.
+                if ui.collapsing_header("Speaking Indicator", TreeNodeFlags::empty()) {
+                    let ind = &mut new_settings.speaking_indicator;
+
+                    if ui.checkbox("Enable", &mut ind.enabled) {
+                        settings_changed = true;
+                    }
+                    ui.text_disabled("Floating list of who is currently speaking");
+
+                    if ui.checkbox("Show when nobody is speaking", &mut ind.show_when_silent) {
+                        settings_changed = true;
+                    }
+                    ui.text_disabled("Keeps the overlay visible so you can drag it or right-click for options");
+                }
+
+                ui.separator();
+
                 // Mute/Deaf controls
                 if ui.collapsing_header("Controls", TreeNodeFlags::DEFAULT_OPEN) {
                     let mut muted = new_settings.is_muted;
@@ -560,12 +581,27 @@ impl SettingsWindow {
                     if peers.is_empty() {
                         ui.text_disabled("No players nearby");
                     } else {
-                        for peer in peers {
-                            let icon = if peer.is_speaking { "[*]" } else { "[ ]" };
-                            ui.text(format!("{} {}", icon, peer.player_name));
+                        // Align mute buttons across rows by computing the
+                        // widest row label up front, so they don't shift
+                        // around with the player names.
+                        let row_labels: Vec<String> = peers
+                            .iter()
+                            .map(|p| {
+                                let icon = if p.is_speaking { "[*]" } else { "[ ]" };
+                                format!("{} {}", icon, p.player_name)
+                            })
+                            .collect();
+                        let mute_col_x = row_labels
+                            .iter()
+                            .map(|l| ui.calc_text_size(l)[0])
+                            .fold(0.0_f32, f32::max)
+                            + 12.0;
+
+                        for (peer, label) in peers.iter().zip(row_labels.iter()) {
+                            ui.text(label);
 
                             // Per-peer controls
-                            ui.same_line();
+                            ui.same_line_with_pos(mute_col_x);
                             if peer.is_muted {
                                 if ui.small_button(format!("Unmute##{}", peer.peer_id)) {
                                     self.pending_mutes.push((peer.peer_id.clone(), false));
@@ -631,6 +667,7 @@ impl SettingsWindow {
                 s.gw2_api_key = settings.gw2_api_key;
                 s.room_type_volumes = settings.room_type_volumes;
                 s.auto_join_group_rooms = settings.auto_join_group_rooms;
+                s.speaking_indicator = settings.speaking_indicator;
             });
             crate::voice::persist::save_settings(&voice_manager.settings());
 
