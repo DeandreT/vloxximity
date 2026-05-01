@@ -1,0 +1,55 @@
+name: Build release artifacts
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-server:
+    name: Build server (linux)
+    if: startsWith(github.event.release.tag_name, 'vloxximity-server-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p vloxximity-server --release --locked
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/vloxximity-server-${{ github.event.release.tag_name }}-x86_64-unknown-linux-gnu.tar.gz" vloxximity-server
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/*
+
+  build-client:
+    name: Build client (windows)
+    if: startsWith(github.event.release.tag_name, 'vloxximity-client-')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p vloxximity-client --target x86_64-pc-windows-msvc --release --locked
+      - name: Stage DLL
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/x86_64-pc-windows-msvc/release/vloxximity_client.dll" "dist/${{ github.event.release.tag_name }}.dll"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/*
