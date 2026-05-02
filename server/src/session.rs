@@ -323,6 +323,28 @@ async fn handle_client_message(
                 return;
             }
 
+            // PvP team room: validate format and that the team color is a
+            // known PvP team (Red=9 or Blue=5). Match-instance verification
+            // is not possible via the GW2 API in real-time; the instance key
+            // in the room id is opaque and derived from MumbleLink context,
+            // so only peers inside the same match can know the correct key.
+            if let Some(rest) = room_id.strip_prefix("pvp-team:") {
+                let Some((_match_key, claimed_color)) = parse_pvp_room_rest(rest) else {
+                    let _ = direct_tx.send(ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: "malformed pvp-team room id".to_string(),
+                    });
+                    return;
+                };
+                if !is_pvp_team_color(claimed_color) {
+                    let _ = direct_tx.send(ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: "unrecognized PvP team color".to_string(),
+                    });
+                    return;
+                }
+            }
+
             // WvW team room verification: ensure the claimed world and team
             // color match what the GW2 API actually says about this account.
             if let Some(rest) = room_id.strip_prefix("wvw-team:") {
@@ -572,6 +594,23 @@ fn parse_wvw_room_rest(rest: &str) -> Option<(u32, u32)> {
     Some((world_str.parse().ok()?, color_str.parse().ok()?))
 }
 
+/// Parse the `<match_key>-<team_color_id>` suffix of a `pvp-team:` room id.
+/// `match_key` is a hex string (no dashes), so `split_once('-')` correctly
+/// separates it from the numeric `team_color_id`.
+fn parse_pvp_room_rest(rest: &str) -> Option<(String, u32)> {
+    let (match_key, color_str) = rest.split_once('-')?;
+    if match_key.is_empty() {
+        return None;
+    }
+    Some((match_key.to_string(), color_str.parse().ok()?))
+}
+
+/// PvP only uses two teams: Red (9) and Blue (5), matching the WvW dye
+/// color IDs that GW2 also uses for `team_color_id` in PvP arenas.
+fn is_pvp_team_color(color_id: u32) -> bool {
+    matches!(color_id, 9 | 5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +732,39 @@ mod tests {
         assert_eq!(parse_wvw_room_rest("1001-xyz"), None);
         assert_eq!(parse_wvw_room_rest("-9"), None);
         assert_eq!(parse_wvw_room_rest("1001-"), None);
+    }
+
+    #[test]
+    fn parse_pvp_room_rest_valid() {
+        assert_eq!(
+            parse_pvp_room_rest("aabbccdd11223344-9"),
+            Some(("aabbccdd11223344".to_string(), 9))
+        );
+        assert_eq!(
+            parse_pvp_room_rest("aabbccdd11223344-5"),
+            Some(("aabbccdd11223344".to_string(), 5))
+        );
+    }
+
+    #[test]
+    fn parse_pvp_room_rest_invalid() {
+        assert_eq!(parse_pvp_room_rest(""), None);
+        assert_eq!(parse_pvp_room_rest("nohyphen"), None);
+        assert_eq!(parse_pvp_room_rest("-9"), None);
+        assert_eq!(parse_pvp_room_rest("aabbccdd-xyz"), None);
+        assert_eq!(parse_pvp_room_rest("aabbccdd-"), None);
+    }
+
+    #[test]
+    fn pvp_team_color_accepts_known_colors() {
+        assert!(is_pvp_team_color(9));
+        assert!(is_pvp_team_color(5));
+    }
+
+    #[test]
+    fn pvp_team_color_rejects_unknown_colors() {
+        assert!(!is_pvp_team_color(0));
+        assert!(!is_pvp_team_color(23));
+        assert!(!is_pvp_team_color(1));
     }
 }

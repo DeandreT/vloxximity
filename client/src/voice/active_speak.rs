@@ -28,7 +28,7 @@ pub struct ActiveSpeak {
 
 struct State {
     default_held: bool,
-    per_type: [KeyState; 4],
+    per_type: [KeyState; 5],
 }
 
 #[derive(Default, Clone, Copy)]
@@ -43,6 +43,7 @@ fn type_index(ty: RoomType) -> usize {
         RoomType::Squad => 1,
         RoomType::Party => 2,
         RoomType::WvwTeam => 3,
+        RoomType::PvpTeam => 4,
     }
 }
 
@@ -51,7 +52,7 @@ impl ActiveSpeak {
         Self {
             state: Arc::new(Mutex::new(State {
                 default_held: false,
-                per_type: [KeyState::default(); 4],
+                per_type: [KeyState::default(); 5],
             })),
         }
     }
@@ -97,9 +98,15 @@ impl ActiveSpeak {
 
         // 1. Per-type PTTs: pick the latest-pressed held key.
         let mut held: Vec<(RoomType, Instant)> = Vec::new();
-        for (idx, ty) in [RoomType::Map, RoomType::Squad, RoomType::Party, RoomType::WvwTeam]
-            .iter()
-            .enumerate()
+        for (idx, ty) in [
+            RoomType::Map,
+            RoomType::Squad,
+            RoomType::Party,
+            RoomType::WvwTeam,
+            RoomType::PvpTeam,
+        ]
+        .iter()
+        .enumerate()
         {
             let key = &s.per_type[idx];
             if key.held {
@@ -129,12 +136,15 @@ impl Default for ActiveSpeak {
     }
 }
 
-/// `squad > party > wvw-team > map`.
+/// `squad > party > pvp-team > wvw-team > map`.
 fn fallback_chain(joined_rooms: &HashMap<String, Instant>) -> Option<String> {
     if let Some(r) = latest_room_of_type(joined_rooms, RoomType::Squad) {
         return Some(r);
     }
     if let Some(r) = latest_room_of_type(joined_rooms, RoomType::Party) {
+        return Some(r);
+    }
+    if let Some(r) = latest_room_of_type(joined_rooms, RoomType::PvpTeam) {
         return Some(r);
     }
     latest_room_of_type(joined_rooms, RoomType::WvwTeam)

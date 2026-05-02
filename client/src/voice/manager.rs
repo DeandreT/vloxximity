@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::thread::AudioCommand;
 use crate::audio::{AudioThread, IncomingAudioCommand, OpusEncoder, VoiceActivityDetector};
-use crate::position::mumble_link::{MAP_TYPE_WVW_MAX, MAP_TYPE_WVW_MIN};
+use crate::position::mumble_link::{is_pvp_map_type, MAP_TYPE_WVW_MAX, MAP_TYPE_WVW_MIN};
 use crate::position::MumbleLink;
 use nexus::rtapi::RealTimeApi;
 
@@ -62,6 +62,10 @@ pub struct VoiceManager {
     /// auto-join logic currently owns. Set when the player enters a WvW
     /// map, cleared when they leave WvW or the team assignment changes.
     current_wvw_team_room: Option<String>,
+    /// The PvP team room (`pvp-team:<match_key>-<team_color_id>`) the
+    /// auto-join logic currently owns. Set when the player enters a PvP
+    /// arena, cleared when the match ends or the player leaves the arena.
+    current_pvp_team_room: Option<String>,
     /// Cluster ids the user has manually left this session. The reconciler
     /// won't auto-rejoin a room whose cluster is in this set, until the
     /// cluster id changes (e.g. a fresh squad is formed).
@@ -174,6 +178,7 @@ impl VoiceManager {
             current_map_room: None,
             current_group_room: None,
             current_wvw_team_room: None,
+            current_pvp_team_room: None,
             suppressed_clusters: HashSet::new(),
             audio_thread: None,
             encoder: None,
@@ -332,22 +337,18 @@ impl VoiceManager {
             // regardless of which WvW map they're on. Only set while the
             // map_type falls in the WvW range (10–18) so PvP team colors
             // don't accidentally route players into a WvW team room.
-            let wvw_team_room_id =
-                if state.is_in_game() && self.settings.auto_join_wvw_rooms {
-                    state
-                        .identity
-                        .as_ref()
-                        .filter(|id| {
-                            id.team_color_id != 0
-                                && (MAP_TYPE_WVW_MIN..=MAP_TYPE_WVW_MAX)
-                                    .contains(&state.map_type)
-                        })
-                        .map(|id| {
-                            format!("wvw-team:{}-{}", id.world_id, id.team_color_id)
-                        })
-                } else {
-                    None
-                };
+            let wvw_team_room_id = if state.is_in_game() && self.settings.auto_join_wvw_rooms {
+                state
+                    .identity
+                    .as_ref()
+                    .filter(|id| {
+                        id.team_color_id != 0
+                            && (MAP_TYPE_WVW_MIN..=MAP_TYPE_WVW_MAX).contains(&state.map_type)
+                    })
+                    .map(|id| format!("wvw-team:{}-{}", id.world_id, id.team_color_id))
+            } else {
+                None
+            };
 
             if self.current_wvw_team_room != wvw_team_room_id {
                 if let Some(old) = self.current_wvw_team_room.take() {
@@ -369,6 +370,47 @@ impl VoiceManager {
                     self.join_room(new_room, &player_name)?;
                 }
                 self.current_wvw_team_room = wvw_team_room_id;
+            }
+
+            // Auto-manage the PvP team room. Scoped by match instance
+            // (pvp_match_key) + team so only teammates in the same match
+            // share a room. Leaves automatically when the player exits the
+            // arena (pvp_match_key becomes None).
+            let pvp_team_room_id =
+                if state.is_in_game() && self.settings.auto_join_pvp_rooms {
+                    state
+                        .identity
+                        .as_ref()
+                        .filter(|id| id.team_color_id != 0 && is_pvp_map_type(state.map_type))
+                        .and_then(|id| {
+                            state.pvp_match_key.as_ref().map(|key| {
+                                format!("pvp-team:{}-{}", key, id.team_color_id)
+                            })
+                        })
+                } else {
+                    None
+                };
+
+            if self.current_pvp_team_room != pvp_team_room_id {
+                if let Some(old) = self.current_pvp_team_room.take() {
+                    self.leave_room(&old);
+                }
+                if let Some(new_room) = pvp_team_room_id.as_deref() {
+                    let player_name = state
+                        .identity
+                        .as_ref()
+                        .and_then(|i| {
+                            let n = i.name.trim();
+                            if n.is_empty() {
+                                None
+                            } else {
+                                Some(i.name.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    self.join_room(new_room, &player_name)?;
+                }
+                self.current_pvp_team_room = pvp_team_room_id;
             }
 
             // Send position updates (throttled)
@@ -713,6 +755,9 @@ impl VoiceManager {
                     if self.current_wvw_team_room.as_deref() == Some(room_id.as_str()) {
                         self.current_wvw_team_room = None;
                     }
+                    if self.current_pvp_team_room.as_deref() == Some(room_id.as_str()) {
+                        self.current_pvp_team_room = None;
+                    }
                     if self.joined_rooms.is_empty() {
                         self.state = VoiceState::Connected;
                         self.peers.clear();
@@ -850,6 +895,7 @@ impl VoiceManager {
             self.current_map_room = None;
             self.current_group_room = None;
             self.current_wvw_team_room = None;
+            self.current_pvp_team_room = None;
         }
         self.last_join_rejection = None;
 
@@ -1397,6 +1443,7 @@ impl VoiceManager {
         self.current_map_room = None;
         self.current_group_room = None;
         self.current_wvw_team_room = None;
+        self.current_pvp_team_room = None;
         self.suppressed_clusters.clear();
         self.state = VoiceState::Disconnected;
     }
@@ -1427,7 +1474,7 @@ impl VoiceManager {
             anyhow::bail!("Room id is empty");
         }
         if RoomType::from_room_id(id).is_none() {
-            anyhow::bail!("Room id must start with map:, squad:, party:, or wvw-team:");
+            anyhow::bail!("Room id must start with map:, squad:, party:, wvw-team:, or pvp-team:");
         }
         if self.joined_rooms.contains_key(id) {
             return Ok(());
@@ -1458,6 +1505,9 @@ impl VoiceManager {
             // User explicitly left the WvW team room; clear the tracker so the
             // next MumbleLink tick can re-evaluate (e.g. team changed).
             self.current_wvw_team_room = None;
+        }
+        if self.current_pvp_team_room.as_deref() == Some(room_id) {
+            self.current_pvp_team_room = None;
         }
         self.leave_room(room_id);
     }

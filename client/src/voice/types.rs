@@ -76,6 +76,11 @@ pub struct VoiceSettings {
     /// player exits WvW or the team assignment changes.
     #[serde(default = "default_true")]
     pub auto_join_wvw_rooms: bool,
+    /// When true, auto-joins a `pvp-team:<match_key>-<team_color_id>` room
+    /// while the local player is in a PvP arena. Leaves the room when the
+    /// match ends or the player returns to the lobby.
+    #[serde(default = "default_true")]
+    pub auto_join_pvp_rooms: bool,
     #[serde(default)]
     pub speaking_indicator: SpeakingIndicatorSettings,
 }
@@ -141,6 +146,7 @@ impl Default for VoiceSettings {
             room_type_volumes: RoomTypeVolumes::default(),
             auto_join_group_rooms: true,
             auto_join_wvw_rooms: true,
+            auto_join_pvp_rooms: true,
             speaking_indicator: SpeakingIndicatorSettings::default(),
         }
     }
