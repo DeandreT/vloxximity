@@ -11,6 +11,7 @@ mod session;
 mod squad;
 mod sweeper;
 mod test_peer;
+mod wvw;
 
 use axum::{
     extract::ws::WebSocketUpgrade, extract::State, response::IntoResponse, routing::get, Router,
@@ -40,6 +41,7 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub http: reqwest::Client,
     pub gw2_cache: gw2::Gw2Cache,
+    pub wvw_cache: wvw::WvwMatchCache,
 }
 
 #[tokio::main]
@@ -73,6 +75,7 @@ async fn main() {
         config: Arc::new(config),
         http,
         gw2_cache: gw2::new_cache(),
+        wvw_cache: wvw::new_match_cache(),
     };
 
     sweeper::spawn_sweeper(state.rooms.clone(), state.squads.clone());

@@ -12,6 +12,7 @@ pub enum RoomType {
     Map,
     Squad,
     Party,
+    WvwTeam,
 }
 
 impl RoomType {
@@ -23,6 +24,7 @@ impl RoomType {
             "map" => Some(RoomType::Map),
             "squad" => Some(RoomType::Squad),
             "party" => Some(RoomType::Party),
+            "wvw-team" => Some(RoomType::WvwTeam),
             _ => None,
         }
     }
@@ -33,6 +35,7 @@ impl RoomType {
             RoomType::Map => "Map",
             RoomType::Squad => "Squad",
             RoomType::Party => "Party",
+            RoomType::WvwTeam => "WvW Team",
         }
     }
 }
@@ -47,6 +50,7 @@ pub struct RoomTypeVolumes {
     pub map: f32,
     pub squad: f32,
     pub party: f32,
+    pub wvw_team: f32,
 }
 
 impl Default for RoomTypeVolumes {
@@ -55,6 +59,7 @@ impl Default for RoomTypeVolumes {
             map: 1.0,
             squad: 1.0,
             party: 1.0,
+            wvw_team: 1.0,
         }
     }
 }
@@ -65,6 +70,7 @@ impl RoomTypeVolumes {
             RoomType::Map => self.map,
             RoomType::Squad => self.squad,
             RoomType::Party => self.party,
+            RoomType::WvwTeam => self.wvw_team,
         }
     }
 
@@ -74,6 +80,7 @@ impl RoomTypeVolumes {
             RoomType::Map => self.map = v,
             RoomType::Squad => self.squad = v,
             RoomType::Party => self.party = v,
+            RoomType::WvwTeam => self.wvw_team = v,
         }
     }
 }
@@ -87,6 +94,10 @@ mod tests {
         assert_eq!(RoomType::from_room_id("map:abc"), Some(RoomType::Map));
         assert_eq!(RoomType::from_room_id("squad:xyz"), Some(RoomType::Squad));
         assert_eq!(RoomType::from_room_id("party:1"), Some(RoomType::Party));
+        assert_eq!(
+            RoomType::from_room_id("wvw-team:1234-9"),
+            Some(RoomType::WvwTeam)
+        );
     }
 
     #[test]
@@ -102,6 +113,7 @@ mod tests {
         assert_eq!(v.get(RoomType::Map), 1.0);
         assert_eq!(v.get(RoomType::Squad), 1.0);
         assert_eq!(v.get(RoomType::Party), 1.0);
+        assert_eq!(v.get(RoomType::WvwTeam), 1.0);
     }
 
     #[test]
@@ -121,5 +133,6 @@ mod tests {
         let parsed: RoomTypeVolumes = serde_json::from_str(json).expect("parse");
         assert_eq!(parsed.map, 1.0);
         assert_eq!(parsed.squad, 1.0);
+        assert_eq!(parsed.wvw_team, 1.0);
     }
 }

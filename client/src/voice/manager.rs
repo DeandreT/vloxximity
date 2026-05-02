@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use parking_lot::RwLock as PlRwLock;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,265 +10,29 @@ use tokio::sync::mpsc;
 
 use crate::audio::thread::AudioCommand;
 use crate::audio::{AudioThread, IncomingAudioCommand, OpusEncoder, VoiceActivityDetector};
-use crate::network::{ConnectionState, PeerInfo, ServerMessage, SignalingClient};
+use crate::position::mumble_link::{MAP_TYPE_WVW_MAX, MAP_TYPE_WVW_MIN};
 use crate::position::MumbleLink;
 use nexus::rtapi::RealTimeApi;
 
 use super::active_speak::ActiveSpeak;
 use super::group::{GroupKind, GroupMemberEvent, GroupState};
+use super::network::{network_task, NetworkCommand, NetworkEvent};
 use super::peer::VoicePeer;
 use super::persist;
-use super::room_type::{RoomType, RoomTypeVolumes};
+use super::room_type::RoomType;
 
-/// Result of a local GW2 API key validation. Lives in a shared slot on
-/// `VoiceManager` so a background tokio task can write the result and the
-/// UI can read it on the next frame.
-#[derive(Debug, Clone)]
-pub enum ApiKeyStatus {
-    /// No key entered, or the current key hasn't been validated yet.
-    Unknown,
-    /// A validation request is in flight.
-    Validating,
-    /// GW2 returned an account handle for this key. `checked_at` is roughly
-    /// when validation completed (used to suppress stale UI messages).
-    Valid { account_name: String },
-    /// GW2 rejected the key or the request failed. `message` is a short,
-    /// user-visible reason.
-    Invalid { message: String },
-}
-
-/// Voice activation mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VoiceMode {
-    /// Push-to-talk
-    PushToTalk,
-    /// Voice activity detection
-    VoiceActivity,
-    /// Always transmit
-    AlwaysOn,
-}
-
-/// Default signaling server URL
-pub const DEFAULT_SERVER_URL: &str = "ws://localhost:8080/ws";
+// Re-exported so existing callers using `crate::voice::manager::*` paths
+// (e.g. `ui/settings.rs`, `voice/persist/settings.rs`) keep working after
+// the type definitions moved to `super::types`.
+pub use super::types::{
+    ApiKeyStatus, GroupSuggestions, NearbyPeer, SpeakingIndicatorSettings, VoiceMode,
+    VoiceSettings, VoiceState, DEFAULT_SERVER_URL,
+};
 
 /// Extract the cluster portion of a `squad:<id>` / `party:<id>` room id.
 /// Returns `None` for room ids that don't follow the prefixed scheme.
 fn cluster_id_from_room(room_id: &str) -> Option<&str> {
     room_id.split_once(':').map(|(_, rest)| rest)
-}
-
-/// Voice manager settings. `#[serde(default)]` on the struct keeps older
-/// on-disk configs loadable as we add new fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VoiceSettings {
-    pub mode: VoiceMode,
-    pub ptt_key: u32,
-    pub min_distance: f32,
-    pub max_distance: f32,
-    pub input_volume: f32,
-    pub output_volume: f32,
-    /// Session-only
-    pub is_muted: bool,
-    /// Session-only
-    #[serde(skip)]
-    pub is_deafened: bool,
-    /// Master switch for directional cues. When false, all peers play centered
-    /// (mono → both ears) with distance attenuation only.
-    pub directional_audio_enabled: bool,
-    /// When directional audio is on, selects 3D filter model vs legacy 2D pan.
-    pub spatial_3d_enabled: bool,
-    pub show_peer_markers: bool,
-    pub server_url: String,
-    #[serde(skip)]
-    pub gw2_api_key: String,
-    /// Per-room-type playback gain. Map rooms keep the spatial pipeline;
-    /// squad/party play centered with this gain on top of the
-    /// per-peer and master output volumes.
-    #[serde(default)]
-    pub room_type_volumes: RoomTypeVolumes,
-    /// When true, the client auto-joins a `squad:<cluster>` or
-    /// `party:<cluster>` room while the local player is in a GW2
-    /// squad/party. The map room is always auto-managed off MumbleLink.
-    #[serde(default = "default_true")]
-    pub auto_join_group_rooms: bool,
-    #[serde(default)]
-    pub speaking_indicator: SpeakingIndicatorSettings,
-}
-
-/// Customisation for the floating "who is speaking" overlay. Defaults
-/// preserve the legacy top-right pill behaviour so existing users don't
-/// see a sudden change after upgrading.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SpeakingIndicatorSettings {
-    pub enabled: bool,
-    /// When true, the overlay stays visible even with no active speakers
-    /// so the user can right-click it to tweak settings or drag it.
-    pub show_when_silent: bool,
-    /// When true, the overlay sticks to its configured position.
-    pub locked: bool,
-    /// User-chosen screen position. `None` falls back to the auto-placed
-    /// top-right corner.
-    pub position: Option<[f32; 2]>,
-    pub show_mute_buttons: bool,
-    pub show_coordinates: bool,
-    pub show_account_names: bool,
-    pub max_visible: u32,
-    pub bg_alpha: f32,
-}
-
-impl Default for SpeakingIndicatorSettings {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            show_when_silent: false,
-            locked: true,
-            position: None,
-            show_mute_buttons: false,
-            show_coordinates: false,
-            show_account_names: false,
-            max_visible: 5,
-            bg_alpha: 0.7,
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for VoiceSettings {
-    fn default() -> Self {
-        Self {
-            mode: VoiceMode::PushToTalk,
-            ptt_key: 0,
-            min_distance: 100.0,
-            max_distance: 5000.0,
-            input_volume: 1.0,
-            output_volume: 1.0,
-            is_muted: false,
-            is_deafened: false,
-            directional_audio_enabled: true,
-            spatial_3d_enabled: true,
-            show_peer_markers: false,
-            server_url: DEFAULT_SERVER_URL.to_string(),
-            gw2_api_key: String::new(),
-            room_type_volumes: RoomTypeVolumes::default(),
-            auto_join_group_rooms: true,
-            speaking_indicator: SpeakingIndicatorSettings::default(),
-        }
-    }
-}
-
-/// Voice manager state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoiceState {
-    Disconnected,
-    Connecting,
-    Connected,
-    InRoom,
-}
-
-/// Suggested rooms derived from RTAPI group state + the server's
-/// clustering reply. Surfaced in the settings UI as click-to-join rows.
-#[derive(Debug, Clone)]
-pub struct GroupSuggestions {
-    pub room_id: String,
-    pub member_count: usize,
-    pub commander_account_name: Option<String>,
-    pub kind: GroupKind,
-}
-
-/// Snapshot of a peer for UI display.
-#[derive(Debug, Clone)]
-pub struct NearbyPeer {
-    pub peer_id: String,
-    pub player_name: String,
-    /// Server-validated GW2 account handle, when known.
-    pub account_name: Option<String>,
-    pub is_speaking: bool,
-    pub is_muted: bool,
-    pub position: crate::position::Position,
-    /// Distance from the local listener. `None` if no listener position is known yet.
-    pub distance: Option<f32>,
-}
-
-/// Commands to send to the network task
-#[derive(Debug)]
-pub enum NetworkCommand {
-    Connect,
-    Disconnect,
-    JoinRoom {
-        room_id: String,
-        player_name: String,
-        api_key: Option<String>,
-    },
-    ValidateApiKey {
-        api_key: String,
-    },
-    /// Leave a single room (`Some`) or every joined room (`None`).
-    LeaveRoom {
-        room_id: Option<String>,
-    },
-    UpdatePosition {
-        position: crate::position::Position,
-        front: crate::position::Position,
-    },
-    SendAudio {
-        room_id: String,
-        data: Vec<u8>,
-    },
-    /// Forward a debounced group snapshot to the server for clustering.
-    IdentifyGroup {
-        members: Vec<String>,
-    },
-}
-
-/// Events received from the network task
-#[derive(Debug)]
-pub enum NetworkEvent {
-    Connected {
-        peer_id: String,
-    },
-    Disconnected,
-    AccountValidated {
-        account_name: Option<String>,
-    },
-    RoomJoined {
-        room_id: String,
-        peers: Vec<PeerInfo>,
-    },
-    JoinRejected {
-        room_id: String,
-        reason: String,
-    },
-    PeerJoined {
-        room_id: String,
-        peer_id: String,
-        player_name: String,
-        account_name: Option<String>,
-    },
-    PeerLeft {
-        room_id: String,
-        peer_id: String,
-    },
-    PeerPosition {
-        peer_id: String,
-        position: crate::position::Position,
-        front: crate::position::Position,
-    },
-    AudioReceived {
-        room_id: String,
-        peer_id: String,
-        data: Vec<u8>,
-    },
-    GroupIdentified {
-        cluster_id: String,
-    },
-    Error {
-        message: String,
-    },
 }
 
 /// Central voice manager
@@ -295,6 +58,10 @@ pub struct VoiceManager {
     /// Cleared when the group disbands, the cluster id changes, the user
     /// manually leaves the room, or the server rejects the join.
     current_group_room: Option<String>,
+    /// The WvW team room (`wvw-team:<world_id>-<team_color_id>`) the
+    /// auto-join logic currently owns. Set when the player enters a WvW
+    /// map, cleared when they leave WvW or the team assignment changes.
+    current_wvw_team_room: Option<String>,
     /// Cluster ids the user has manually left this session. The reconciler
     /// won't auto-rejoin a room whose cluster is in this set, until the
     /// cluster id changes (e.g. a fresh squad is formed).
@@ -406,6 +173,7 @@ impl VoiceManager {
             joined_rooms: HashMap::new(),
             current_map_room: None,
             current_group_room: None,
+            current_wvw_team_room: None,
             suppressed_clusters: HashSet::new(),
             audio_thread: None,
             encoder: None,
@@ -557,6 +325,50 @@ impl VoiceManager {
 
                     self.join_room(new_room, &player_name)?;
                 }
+            }
+
+            // Auto-manage the WvW team room. Derived from world_id and
+            // team_color_id so all players on the same team share one room
+            // regardless of which WvW map they're on. Only set while the
+            // map_type falls in the WvW range (10–18) so PvP team colors
+            // don't accidentally route players into a WvW team room.
+            let wvw_team_room_id =
+                if state.is_in_game() && self.settings.auto_join_wvw_rooms {
+                    state
+                        .identity
+                        .as_ref()
+                        .filter(|id| {
+                            id.team_color_id != 0
+                                && (MAP_TYPE_WVW_MIN..=MAP_TYPE_WVW_MAX)
+                                    .contains(&state.map_type)
+                        })
+                        .map(|id| {
+                            format!("wvw-team:{}-{}", id.world_id, id.team_color_id)
+                        })
+                } else {
+                    None
+                };
+
+            if self.current_wvw_team_room != wvw_team_room_id {
+                if let Some(old) = self.current_wvw_team_room.take() {
+                    self.leave_room(&old);
+                }
+                if let Some(new_room) = wvw_team_room_id.as_deref() {
+                    let player_name = state
+                        .identity
+                        .as_ref()
+                        .and_then(|i| {
+                            let n = i.name.trim();
+                            if n.is_empty() {
+                                None
+                            } else {
+                                Some(i.name.clone())
+                            }
+                        })
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    self.join_room(new_room, &player_name)?;
+                }
+                self.current_wvw_team_room = wvw_team_room_id;
             }
 
             // Send position updates (throttled)
@@ -898,6 +710,9 @@ impl VoiceManager {
                     if self.current_group_room.as_deref() == Some(room_id.as_str()) {
                         self.current_group_room = None;
                     }
+                    if self.current_wvw_team_room.as_deref() == Some(room_id.as_str()) {
+                        self.current_wvw_team_room = None;
+                    }
                     if self.joined_rooms.is_empty() {
                         self.state = VoiceState::Connected;
                         self.peers.clear();
@@ -1034,6 +849,7 @@ impl VoiceManager {
         if self.state != VoiceState::InRoom {
             self.current_map_room = None;
             self.current_group_room = None;
+            self.current_wvw_team_room = None;
         }
         self.last_join_rejection = None;
 
@@ -1580,6 +1396,7 @@ impl VoiceManager {
         self.joined_rooms.clear();
         self.current_map_room = None;
         self.current_group_room = None;
+        self.current_wvw_team_room = None;
         self.suppressed_clusters.clear();
         self.state = VoiceState::Disconnected;
     }
@@ -1610,7 +1427,7 @@ impl VoiceManager {
             anyhow::bail!("Room id is empty");
         }
         if RoomType::from_room_id(id).is_none() {
-            anyhow::bail!("Room id must start with map:, squad:, or party:");
+            anyhow::bail!("Room id must start with map:, squad:, party:, or wvw-team:");
         }
         if self.joined_rooms.contains_key(id) {
             return Ok(());
@@ -1636,6 +1453,11 @@ impl VoiceManager {
                 self.suppressed_clusters.insert(cluster.to_string());
             }
             self.current_group_room = None;
+        }
+        if self.current_wvw_team_room.as_deref() == Some(room_id) {
+            // User explicitly left the WvW team room; clear the tracker so the
+            // next MumbleLink tick can re-evaluate (e.g. team changed).
+            self.current_wvw_team_room = None;
         }
         self.leave_room(room_id);
     }
@@ -1694,209 +1516,6 @@ impl Drop for VoiceManager {
             self.shutdown();
         }
     }
-}
-
-/// Async network task that handles signaling and audio relay
-async fn network_task(
-    server_url: String,
-    mut cmd_rx: mpsc::UnboundedReceiver<NetworkCommand>,
-    event_tx: std::sync::mpsc::Sender<NetworkEvent>,
-    incoming_audio_tx: crossbeam_channel::Sender<IncomingAudioCommand>,
-) {
-    log::info!("Network task started");
-
-    let mut signaling_client = SignalingClient::new(&server_url);
-    let mut signaling_event_rx: Option<mpsc::UnboundedReceiver<ServerMessage>> = None;
-    let mut was_connected = false;
-
-    let mut reconnect_timer = tokio::time::interval(std::time::Duration::from_secs(2));
-    reconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Skip the immediate first tick so we don't race the initial Connect command.
-    reconnect_timer.tick().await;
-
-    loop {
-        tokio::select! {
-            // Handle commands from VoiceManager
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    NetworkCommand::Connect => {
-                        log::info!("Connecting to signaling server...");
-                        match signaling_client.connect().await {
-                            Ok(()) => {
-                                signaling_event_rx = signaling_client.take_event_receiver();
-                            }
-                            Err(e) => {
-                                log::error!("Failed to connect: {}", e);
-                                let _ = event_tx.send(NetworkEvent::Error {
-                                    message: format!("Connection failed: {}", e),
-                                });
-                            }
-                        }
-                    }
-                    NetworkCommand::Disconnect => {
-                        log::info!("Disconnecting...");
-                        signaling_client.disconnect();
-                        let _ = incoming_audio_tx.send(IncomingAudioCommand::ResetIncoming);
-                        let _ = event_tx.send(NetworkEvent::Disconnected);
-                        break;
-                    }
-                    NetworkCommand::JoinRoom { room_id, player_name, api_key } => {
-                        if let Err(e) = signaling_client.join_room(
-                            &room_id,
-                            &player_name,
-                            api_key.as_deref(),
-                        ) {
-                            log::error!("Failed to join room: {}", e);
-                        }
-                    }
-                    NetworkCommand::ValidateApiKey { api_key } => {
-                        if let Err(e) = signaling_client.validate_api_key(&api_key) {
-                            log::error!("Failed to send ValidateApiKey: {}", e);
-                        }
-                    }
-                    NetworkCommand::LeaveRoom { room_id } => {
-                        if let Err(e) = signaling_client.leave_room(room_id.as_deref()) {
-                            log::error!("Failed to leave room: {}", e);
-                        }
-                    }
-                    NetworkCommand::UpdatePosition { position, front } => {
-                        let _ = signaling_client.update_position(position, front);
-                    }
-                    NetworkCommand::SendAudio { room_id, data } => {
-                        let _ = signaling_client.send_audio(&room_id, &data);
-                    }
-                    NetworkCommand::IdentifyGroup { members } => {
-                        if let Err(e) = signaling_client.identify_group(members) {
-                            log::warn!("Failed to send IdentifyGroup: {}", e);
-                        }
-                    }
-                }
-            }
-
-            // Handle signaling events
-            msg = async {
-                if let Some(ref mut rx) = signaling_event_rx {
-                    rx.recv().await
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                match msg {
-                    Some(ServerMessage::Welcome { peer_id }) => {
-                        let _ = event_tx.send(NetworkEvent::Connected { peer_id });
-                    }
-                    Some(ServerMessage::AccountValidated { account_name }) => {
-                        let _ = event_tx.send(NetworkEvent::AccountValidated { account_name });
-                    }
-                    Some(ServerMessage::JoinRejected { room_id, reason }) => {
-                        let _ = event_tx.send(NetworkEvent::JoinRejected { room_id, reason });
-                    }
-                    Some(ServerMessage::RoomJoined { room_id, peers }) => {
-                        for peer in &peers {
-                            let _ = incoming_audio_tx.send(IncomingAudioCommand::UpsertPeer {
-                                peer_id: peer.peer_id.clone(),
-                                player_name: peer.player_name.clone(),
-                            });
-                            if let (Some(position), Some(front)) = (peer.position, peer.front) {
-                                let _ = incoming_audio_tx.send(IncomingAudioCommand::SetPeerPosition {
-                                    peer_id: peer.peer_id.clone(),
-                                    position,
-                                    front,
-                                });
-                            }
-                        }
-                        let _ = event_tx.send(NetworkEvent::RoomJoined { room_id, peers });
-                    }
-                    Some(ServerMessage::PeerJoined { room_id, peer }) => {
-                        let _ = incoming_audio_tx.send(IncomingAudioCommand::UpsertPeer {
-                            peer_id: peer.peer_id.clone(),
-                            player_name: peer.player_name.clone(),
-                        });
-                        let _ = event_tx.send(NetworkEvent::PeerJoined {
-                            room_id,
-                            peer_id: peer.peer_id,
-                            player_name: peer.player_name,
-                            account_name: peer.account_name,
-                        });
-                    }
-                    Some(ServerMessage::PeerLeft { room_id, peer_id }) => {
-                        // Phase 2: audio thread is peer-keyed, so we can't
-                        // drop "(peer, this room)" alone — let the manager
-                        // decide when the peer's last shared room ended and
-                        // emit RemovePeer then.
-                        let _ = event_tx.send(NetworkEvent::PeerLeft { room_id, peer_id });
-                    }
-                    Some(ServerMessage::PeerPosition { peer_id, position, front }) => {
-                        let _ = incoming_audio_tx.send(IncomingAudioCommand::SetPeerPosition {
-                            peer_id: peer_id.clone(),
-                            position,
-                            front,
-                        });
-                        let _ = event_tx.send(NetworkEvent::PeerPosition { peer_id, position, front });
-                    }
-                    Some(ServerMessage::PeerAudio { room_id, peer_id, data }) => {
-                        let _ = incoming_audio_tx.send(IncomingAudioCommand::PushPeerOpus {
-                            peer_id: peer_id.clone(),
-                            room_id: room_id.clone(),
-                            data: data.clone(),
-                        });
-                        let _ = event_tx.send(NetworkEvent::AudioReceived {
-                            room_id,
-                            peer_id,
-                            data,
-                        });
-                    }
-                    Some(ServerMessage::Error { message }) => {
-                        log::error!("Server error: {}", message);
-                        let _ = event_tx.send(NetworkEvent::Error { message });
-                    }
-                    Some(ServerMessage::Kicked { reason }) => {
-                        log::warn!("Server kicked us: {}", reason);
-                        let _ = event_tx.send(NetworkEvent::Error {
-                            message: format!("Disconnected by server: {}", reason),
-                        });
-                    }
-                    Some(ServerMessage::GroupIdentified { cluster_id }) => {
-                        let _ = event_tx.send(NetworkEvent::GroupIdentified { cluster_id });
-                    }
-                    Some(ServerMessage::Pong) => {
-                        // Keepalive response
-                    }
-                    None => {
-                        // Signaling read task ended — the server dropped us.
-                        signaling_event_rx = None;
-                    }
-                }
-            }
-
-            _ = reconnect_timer.tick() => {
-                // Periodic wake-up to evaluate reconnection below.
-            }
-        }
-
-        let state = signaling_client.state();
-        if state == ConnectionState::Connected {
-            was_connected = true;
-        } else if state == ConnectionState::Disconnected {
-            if was_connected {
-                was_connected = false;
-                let _ = incoming_audio_tx.send(IncomingAudioCommand::ResetIncoming);
-                let _ = event_tx.send(NetworkEvent::Disconnected);
-            }
-            log::info!("Signaling disconnected; attempting reconnect...");
-            match signaling_client.connect().await {
-                Ok(()) => {
-                    signaling_event_rx = signaling_client.take_event_receiver();
-                    log::info!("Signaling reconnect succeeded");
-                }
-                Err(e) => {
-                    log::warn!("Signaling reconnect failed: {}", e);
-                }
-            }
-        }
-    }
-
-    log::info!("Network task stopped");
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use crate::protocol::{
 };
 use crate::rate_limit::PeerRateLimits;
 use crate::rooms::{AccountCapExceeded, RoomEvent};
+use crate::wvw;
 use crate::AppState;
 
 /// Length caps on string fields. Enforced before any DB / API work to keep
@@ -268,7 +269,7 @@ async fn handle_client_message(
                 player_name,
                 if api_key.is_some() { "yes" } else { "no" }
             );
-            let account_name = match api_key.as_deref() {
+            let validated = match api_key.as_deref() {
                 Some(key) if !key.trim().is_empty() => {
                     crate::gw2::validate_api_key(&state.http, &state.gw2_cache, key.trim()).await
                 }
@@ -279,10 +280,10 @@ async fn handle_client_message(
             // leave the "Validating..." state deterministically even when
             // they didn't provide a key (in which case account_name is None).
             let _ = direct_tx.send(ServerMessage::AccountValidated {
-                account_name: account_name.clone(),
+                account_name: validated.as_ref().map(|(name, _)| name.clone()),
             });
 
-            let Some(account_name) = account_name else {
+            let Some((account_name, api_world_id)) = validated else {
                 let reason = if api_key
                     .as_deref()
                     .map(|k| !k.trim().is_empty())
@@ -322,6 +323,58 @@ async fn handle_client_message(
                 return;
             }
 
+            // WvW team room verification: ensure the claimed world and team
+            // color match what the GW2 API actually says about this account.
+            if let Some(rest) = room_id.strip_prefix("wvw-team:") {
+                let Some((claimed_world, claimed_color)) = parse_wvw_room_rest(rest) else {
+                    let _ = direct_tx.send(ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: "malformed wvw-team room id".to_string(),
+                    });
+                    return;
+                };
+
+                if claimed_world != api_world_id {
+                    tracing::info!(
+                        "Rejecting WvW join from {} (room={}): claimed world {} != api world {}",
+                        peer_id,
+                        room_id,
+                        claimed_world,
+                        api_world_id
+                    );
+                    let _ = direct_tx.send(ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: "world does not match your GW2 account".to_string(),
+                    });
+                    return;
+                }
+
+                let Some(claimed_team) = wvw::WvwTeam::from_color_id(claimed_color) else {
+                    let _ = direct_tx.send(ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: "unrecognized WvW team color".to_string(),
+                    });
+                    return;
+                };
+
+                if let Err(reason) =
+                    wvw::verify_team(&state.http, &state.wvw_cache, api_world_id, claimed_team)
+                        .await
+                {
+                    tracing::info!(
+                        "Rejecting WvW join from {} (room={}): {}",
+                        peer_id,
+                        room_id,
+                        reason
+                    );
+                    let _ = direct_tx.send(ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason,
+                    });
+                    return;
+                }
+            }
+
             if let Some(peers) = state.rooms.join_room(peer_id, &room_id, &player_name) {
                 let response = ServerMessage::RoomJoined {
                     room_id: room_id.clone(),
@@ -336,11 +389,12 @@ async fn handle_client_message(
 
         ClientMessage::ValidateApiKey { api_key } => {
             let trimmed = api_key.trim();
-            let account_name = if trimmed.is_empty() {
+            let validated = if trimmed.is_empty() {
                 None
             } else {
                 crate::gw2::validate_api_key(&state.http, &state.gw2_cache, trimmed).await
             };
+            let account_name = validated.map(|(name, _)| name);
             match state
                 .rooms
                 .try_set_account_name(peer_id, account_name.clone())
@@ -511,6 +565,13 @@ fn msg_kind(msg: &ClientMessage) -> &'static str {
     }
 }
 
+/// Parse the `<world_id>-<team_color_id>` suffix of a `wvw-team:` room id.
+/// Returns `None` for malformed input (non-numeric components, missing `-`).
+fn parse_wvw_room_rest(rest: &str) -> Option<(u32, u32)> {
+    let (world_str, color_str) = rest.split_once('-')?;
+    Some((world_str.parse().ok()?, color_str.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +676,22 @@ mod tests {
             &mut rates
         ));
         assert!(apply_rate_limit("p", &ClientMessage::Ping, &mut rates));
+    }
+
+    #[test]
+    fn parse_wvw_room_rest_valid() {
+        assert_eq!(parse_wvw_room_rest("1001-9"), Some((1001, 9)));
+        assert_eq!(parse_wvw_room_rest("2001-5"), Some((2001, 5)));
+        assert_eq!(parse_wvw_room_rest("1234-23"), Some((1234, 23)));
+    }
+
+    #[test]
+    fn parse_wvw_room_rest_invalid() {
+        assert_eq!(parse_wvw_room_rest(""), None);
+        assert_eq!(parse_wvw_room_rest("nohyphen"), None);
+        assert_eq!(parse_wvw_room_rest("abc-9"), None);
+        assert_eq!(parse_wvw_room_rest("1001-xyz"), None);
+        assert_eq!(parse_wvw_room_rest("-9"), None);
+        assert_eq!(parse_wvw_room_rest("1001-"), None);
     }
 }

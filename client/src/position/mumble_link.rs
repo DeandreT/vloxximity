@@ -61,6 +61,17 @@ pub struct PlayerIdentity {
     pub ui_size: u32,
 }
 
+/// GW2 API MapType enum ordinals as reported in the MumbleLink context.
+/// Values 10–18 cover the WvW game modes (Eternal Battlegrounds, Borderlands,
+/// and newer WvW variants). Values 3, 7, and 9 cover PvP arenas and
+/// tournaments. These constants let callers check game mode without
+/// hardcoding raw integers at every call site.
+pub const MAP_TYPE_WVW_MIN: u32 = 10;
+pub const MAP_TYPE_WVW_MAX: u32 = 18;
+pub const MAP_TYPE_COMPETITIVE: u32 = 3;
+pub const MAP_TYPE_TOURNAMENT: u32 = 7;
+pub const MAP_TYPE_USER_TOURNAMENT: u32 = 9;
+
 /// Player state snapshot
 #[derive(Debug, Clone)]
 pub struct PlayerState {
@@ -69,6 +80,7 @@ pub struct PlayerState {
     pub identity: Option<PlayerIdentity>,
     pub room_key: String,
     pub map_id: u32,
+    pub map_type: u32,
     pub ui_tick: u32,
 }
 
@@ -80,6 +92,7 @@ impl Default for PlayerState {
             identity: None,
             room_key: String::new(),
             map_id: 0,
+            map_type: 0,
             ui_tick: 0,
         }
     }
@@ -160,6 +173,7 @@ impl MumbleLink {
         };
 
         let map_id = context.map_id;
+        let map_type = context.map_type;
 
         // Generate room key
         let room_key = generate_room_key(&context);
@@ -176,6 +190,7 @@ impl MumbleLink {
             identity,
             room_key,
             map_id,
+            map_type,
             ui_tick: link.ui_tick,
         })
     }
