@@ -33,6 +33,9 @@ pub type Gw2Cache = Arc<DashMap<String, CachedAccount>>;
 #[derive(Debug, Clone)]
 pub struct CachedAccount {
     pub account_name: Option<String>,
+    /// Home world ID from `/v2/account`. `None` when the key was invalid
+    /// or the response didn't include a world field.
+    pub world_id: Option<u32>,
     pub validated_at: Instant,
 }
 
@@ -47,40 +50,48 @@ fn hash_key(key: &str) -> String {
 }
 
 /// Validate a GW2 API key against `https://api.guildwars2.com/v2/account`.
-/// Returns the account handle (e.g. `Example.1234`) on success, or `None`
-/// when the key is invalid, the API is unreachable, or the cache says it
-/// was recently invalid.
+/// Returns `(account_handle, world_id)` on success, or `None` when the key
+/// is invalid, the API is unreachable, or the cache says it was recently
+/// invalid.
 pub async fn validate_api_key(
     client: &reqwest::Client,
     cache: &Gw2Cache,
     api_key: &str,
-) -> Option<String> {
+) -> Option<(String, u32)> {
     let hash = hash_key(api_key);
 
     // Serve from cache if the entry is still fresh.
     if let Some(entry) = cache.get(&hash) {
         if entry.validated_at.elapsed() < CACHE_TTL {
-            return entry.account_name.clone();
+            return entry
+                .account_name
+                .clone()
+                .zip(entry.world_id);
         }
     }
 
-    let account_name = fetch_account_name(client, api_key).await;
+    let result = fetch_account_info(client, api_key).await;
     cache.insert(
         hash,
         CachedAccount {
-            account_name: account_name.clone(),
+            account_name: result.as_ref().map(|(n, _)| n.clone()),
+            world_id: result.as_ref().map(|(_, w)| *w),
             validated_at: Instant::now(),
         },
     );
-    account_name
+    result
 }
 
 #[derive(Debug, Deserialize)]
 struct AccountResponse {
     name: String,
+    world: u32,
 }
 
-async fn fetch_account_name(client: &reqwest::Client, api_key: &str) -> Option<String> {
+async fn fetch_account_info(
+    client: &reqwest::Client,
+    api_key: &str,
+) -> Option<(String, u32)> {
     let url = "https://api.guildwars2.com/v2/account";
     let response = match client
         .get(url)
@@ -102,7 +113,7 @@ async fn fetch_account_name(client: &reqwest::Client, api_key: &str) -> Option<S
     }
 
     match response.json::<AccountResponse>().await {
-        Ok(body) => Some(body.name),
+        Ok(body) => Some((body.name, body.world)),
         Err(e) => {
             tracing::warn!("GW2 API response parse failed: {}", e);
             None
@@ -128,12 +139,13 @@ mod tests {
             hash.clone(),
             CachedAccount {
                 account_name: Some("Cached.0001".to_string()),
+                world_id: Some(1001),
                 validated_at: Instant::now(),
             },
         );
 
         let got = validate_api_key(&client, &cache, key).await;
-        assert_eq!(got.as_deref(), Some("Cached.0001"));
+        assert_eq!(got, Some(("Cached.0001".to_string(), 1001)));
 
         // Negative-cache entries are also honoured: asking again for a key
         // we previously determined invalid returns None without re-hitting
@@ -143,6 +155,7 @@ mod tests {
             hash_key(bad_key),
             CachedAccount {
                 account_name: None,
+                world_id: None,
                 validated_at: Instant::now(),
             },
         );
