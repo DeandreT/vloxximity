@@ -72,6 +72,14 @@ pub const MAP_TYPE_COMPETITIVE: u32 = 3;
 pub const MAP_TYPE_TOURNAMENT: u32 = 7;
 pub const MAP_TYPE_USER_TOURNAMENT: u32 = 9;
 
+/// Returns `true` when `map_type` is one of the three PvP arena types.
+pub fn is_pvp_map_type(map_type: u32) -> bool {
+    matches!(
+        map_type,
+        MAP_TYPE_COMPETITIVE | MAP_TYPE_TOURNAMENT | MAP_TYPE_USER_TOURNAMENT
+    )
+}
+
 /// Player state snapshot
 #[derive(Debug, Clone)]
 pub struct PlayerState {
@@ -82,6 +90,11 @@ pub struct PlayerState {
     pub map_id: u32,
     pub map_type: u32,
     pub ui_tick: u32,
+    /// Opaque key identifying the current PvP match instance. `Some` only
+    /// when `map_type` is a PvP arena type; `None` otherwise. Derived from
+    /// a hash of (server_address + map_id + instance) so it is unique per
+    /// match but stable across the duration of the same match.
+    pub pvp_match_key: Option<String>,
 }
 
 impl Default for PlayerState {
@@ -94,6 +107,7 @@ impl Default for PlayerState {
             map_id: 0,
             map_type: 0,
             ui_tick: 0,
+            pvp_match_key: None,
         }
     }
 }
@@ -184,6 +198,12 @@ impl MumbleLink {
             self.last_room_key = room_key.clone();
         }
 
+        let pvp_match_key = if is_pvp_map_type(map_type) {
+            Some(generate_pvp_match_key(&context))
+        } else {
+            None
+        };
+
         Some(PlayerState {
             transform,
             camera_transform,
@@ -192,6 +212,7 @@ impl MumbleLink {
             map_id,
             map_type,
             ui_tick: link.ui_tick,
+            pvp_match_key,
         })
     }
 }
@@ -291,6 +312,19 @@ fn parse_identity(identity: &[u16; 256]) -> Option<PlayerIdentity> {
             None
         }
     }
+}
+
+/// Generate a stable match key for a PvP instance. Hashes only the fields
+/// that identify a specific match (server address, map id, instance id),
+/// returning the first 16 hex chars. Intentionally excludes map_type and
+/// shard_id so the key is stable across the duration of a single match.
+fn generate_pvp_match_key(context: &MumbleContext) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(&context.server_address);
+    hasher.update(context.map_id.to_le_bytes());
+    hasher.update(context.instance.to_le_bytes());
+    let result = hasher.finalize();
+    hex::encode(&result[..8])
 }
 
 /// Generate a unique room key from MumbleLink context

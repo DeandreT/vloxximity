@@ -116,10 +116,7 @@ fn check_team(actual: WvwTeam, claimed: WvwTeam) -> Result<(), String> {
 /// Fetch which team `world_id` is on from the GW2 WvW matches API.
 /// Searches `all_worlds.{red,blue,green}` so linked worlds are handled
 /// automatically (the API includes both host and linked worlds in each list).
-async fn fetch_world_team(
-    client: &reqwest::Client,
-    world_id: u32,
-) -> Result<WvwTeam, String> {
+async fn fetch_world_team(client: &reqwest::Client, world_id: u32) -> Result<WvwTeam, String> {
     let url = format!(
         "https://api.guildwars2.com/v2/wvw/matches?world={}",
         world_id
@@ -131,7 +128,11 @@ async fn fetch_world_team(
         .send()
         .await
         .map_err(|e| {
-            tracing::warn!("WvW matches API request failed for world {}: {}", world_id, e);
+            tracing::warn!(
+                "WvW matches API request failed for world {}: {}",
+                world_id,
+                e
+            );
             "WvW team could not be verified — try again shortly".to_string()
         })?;
 
@@ -144,13 +145,10 @@ async fn fetch_world_team(
         return Err("WvW team could not be verified — try again shortly".to_string());
     }
 
-    let body = response
-        .json::<MatchResponse>()
-        .await
-        .map_err(|e| {
-            tracing::warn!("WvW matches API parse failed for world {}: {}", world_id, e);
-            "WvW team could not be verified — try again shortly".to_string()
-        })?;
+    let body = response.json::<MatchResponse>().await.map_err(|e| {
+        tracing::warn!("WvW matches API parse failed for world {}: {}", world_id, e);
+        "WvW team could not be verified — try again shortly".to_string()
+    })?;
 
     let worlds = &body.all_worlds;
     if worlds.red.contains(&world_id) {
@@ -209,8 +207,12 @@ mod tests {
             },
         );
         // Correct team succeeds without hitting the network.
-        assert!(verify_team(&client, &cache, 1001, WvwTeam::Red).await.is_ok());
+        assert!(verify_team(&client, &cache, 1001, WvwTeam::Red)
+            .await
+            .is_ok());
         // Wrong team fails immediately from cache.
-        assert!(verify_team(&client, &cache, 1001, WvwTeam::Blue).await.is_err());
+        assert!(verify_team(&client, &cache, 1001, WvwTeam::Blue)
+            .await
+            .is_err());
     }
 }

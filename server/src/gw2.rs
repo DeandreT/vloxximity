@@ -63,10 +63,7 @@ pub async fn validate_api_key(
     // Serve from cache if the entry is still fresh.
     if let Some(entry) = cache.get(&hash) {
         if entry.validated_at.elapsed() < CACHE_TTL {
-            return entry
-                .account_name
-                .clone()
-                .zip(entry.world_id);
+            return entry.account_name.clone().zip(entry.world_id);
         }
     }
 
@@ -88,10 +85,7 @@ struct AccountResponse {
     world: u32,
 }
 
-async fn fetch_account_info(
-    client: &reqwest::Client,
-    api_key: &str,
-) -> Option<(String, u32)> {
+async fn fetch_account_info(client: &reqwest::Client, api_key: &str) -> Option<(String, u32)> {
     let url = "https://api.guildwars2.com/v2/account";
     let response = match client
         .get(url)

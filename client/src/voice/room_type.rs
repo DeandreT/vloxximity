@@ -13,6 +13,7 @@ pub enum RoomType {
     Squad,
     Party,
     WvwTeam,
+    PvpTeam,
 }
 
 impl RoomType {
@@ -25,6 +26,7 @@ impl RoomType {
             "squad" => Some(RoomType::Squad),
             "party" => Some(RoomType::Party),
             "wvw-team" => Some(RoomType::WvwTeam),
+            "pvp-team" => Some(RoomType::PvpTeam),
             _ => None,
         }
     }
@@ -36,6 +38,7 @@ impl RoomType {
             RoomType::Squad => "Squad",
             RoomType::Party => "Party",
             RoomType::WvwTeam => "WvW Team",
+            RoomType::PvpTeam => "PvP Team",
         }
     }
 }
@@ -51,6 +54,12 @@ pub struct RoomTypeVolumes {
     pub squad: f32,
     pub party: f32,
     pub wvw_team: f32,
+    #[serde(default = "default_volume")]
+    pub pvp_team: f32,
+}
+
+fn default_volume() -> f32 {
+    1.0
 }
 
 impl Default for RoomTypeVolumes {
@@ -60,6 +69,7 @@ impl Default for RoomTypeVolumes {
             squad: 1.0,
             party: 1.0,
             wvw_team: 1.0,
+            pvp_team: 1.0,
         }
     }
 }
@@ -71,6 +81,7 @@ impl RoomTypeVolumes {
             RoomType::Squad => self.squad,
             RoomType::Party => self.party,
             RoomType::WvwTeam => self.wvw_team,
+            RoomType::PvpTeam => self.pvp_team,
         }
     }
 
@@ -81,6 +92,7 @@ impl RoomTypeVolumes {
             RoomType::Squad => self.squad = v,
             RoomType::Party => self.party = v,
             RoomType::WvwTeam => self.wvw_team = v,
+            RoomType::PvpTeam => self.pvp_team = v,
         }
     }
 }
@@ -98,6 +110,10 @@ mod tests {
             RoomType::from_room_id("wvw-team:1234-9"),
             Some(RoomType::WvwTeam)
         );
+        assert_eq!(
+            RoomType::from_room_id("pvp-team:aabbccdd-5"),
+            Some(RoomType::PvpTeam)
+        );
     }
 
     #[test]
@@ -114,6 +130,7 @@ mod tests {
         assert_eq!(v.get(RoomType::Squad), 1.0);
         assert_eq!(v.get(RoomType::Party), 1.0);
         assert_eq!(v.get(RoomType::WvwTeam), 1.0);
+        assert_eq!(v.get(RoomType::PvpTeam), 1.0);
     }
 
     #[test]
@@ -134,5 +151,6 @@ mod tests {
         assert_eq!(parsed.map, 1.0);
         assert_eq!(parsed.squad, 1.0);
         assert_eq!(parsed.wvw_team, 1.0);
+        assert_eq!(parsed.pvp_team, 1.0);
     }
 }

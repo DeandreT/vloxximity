@@ -335,7 +335,9 @@ impl SettingsWindow {
                     if ui.checkbox("Show when nobody is speaking", &mut ind.show_when_silent) {
                         settings_changed = true;
                     }
-                    ui.text_disabled("Keeps the overlay visible so you can drag it or right-click for options");
+                    ui.text_disabled(
+                        "Keeps the overlay visible so you can drag it or right-click for options",
+                    );
                 }
 
                 ui.separator();
