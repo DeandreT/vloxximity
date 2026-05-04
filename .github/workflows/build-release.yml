@@ -3,6 +3,12 @@ name: Build release artifacts
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g. vloxximity-server-v0.1.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,32 +19,42 @@ env:
 jobs:
   build-server:
     name: Build server (linux)
-    if: startsWith(github.event.release.tag_name, 'vloxximity-server-')
+    if: |
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'vloxximity-server-')) ||
+      (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'vloxximity-server-'))
     runs-on: ubuntu-latest
     steps:
+      - id: tag
+        shell: bash
+        run: echo "name=${{ inputs.tag || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ steps.tag.outputs.name }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p vloxximity-server --release --locked
       - name: Package
         run: |
           mkdir -p dist
-          tar -C target/release -czf "dist/vloxximity-server-${{ github.event.release.tag_name }}-x86_64-unknown-linux-gnu.tar.gz" vloxximity-server
+          tar -C target/release -czf "dist/${{ steps.tag.outputs.name }}-x86_64-unknown-linux-gnu.tar.gz" vloxximity-server
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ steps.tag.outputs.name }}
           files: dist/*
 
   build-client:
     name: Build client (windows)
-    if: startsWith(github.event.release.tag_name, 'vloxximity-client-')
+    if: |
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'vloxximity-client-')) ||
+      (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'vloxximity-client-'))
     runs-on: windows-latest
     steps:
+      - id: tag
+        shell: bash
+        run: echo "name=${{ inputs.tag || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ steps.tag.outputs.name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -48,8 +64,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/x86_64-pc-windows-msvc/release/vloxximity_client.dll" "dist/${{ github.event.release.tag_name }}.dll"
+          cp "target/x86_64-pc-windows-msvc/release/vloxximity_client.dll" "dist/${{ steps.tag.outputs.name }}.dll"
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ steps.tag.outputs.name }}
           files: dist/*
