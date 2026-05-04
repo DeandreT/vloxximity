@@ -13,6 +13,8 @@ name = "vloxximity-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors = ["DeandreT.7583"]
+description = "Proximity voice chat"
 
 [lib]
 crate-type = ["cdylib"]
@@ -68,4 +70,3 @@ bytes = "1"
 # in Windows-only transitive deps.
 [target.'cfg(windows)'.dependencies]
 keyring = "3"
-
