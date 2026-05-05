@@ -27,6 +27,25 @@ const MAX_API_KEY_LEN: usize = 256;
 /// names are at most ~32 chars in practice; mirror the room-id cap.
 const MAX_ACCOUNT_NAME_LEN: usize = 64;
 
+/// Bound on the per-peer direct-message queue. Mirrors the broadcast
+/// channel buffer above. These are command responses (validate, join,
+/// pong), not high-throughput, so 256 leaves comfortable headroom for
+/// normal bursts while making "stuck writer" detectable as Full.
+const DIRECT_CHANNEL_CAPACITY: usize = 256;
+
+/// Non-blocking send to a peer's direct channel. Drops the message and
+/// logs a warn if the queue is full (writer task is stuck or wildly
+/// behind). Closed errors are silent — the peer is already gone.
+fn try_send_direct(tx: &mpsc::Sender<ServerMessage>, peer_id: &str, msg: ServerMessage) {
+    if let Err(mpsc::error::TrySendError::Full(dropped)) = tx.try_send(msg) {
+        tracing::warn!(
+            "Dropping direct message for {} (channel full): {:?}",
+            peer_id,
+            std::mem::discriminant(&dropped)
+        );
+    }
+}
+
 enum OutgoingWsMessage {
     Text(ServerMessage),
     Binary(Vec<u8>),
@@ -39,8 +58,9 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
     // Create broadcast channel for room events
     let (room_tx, mut room_rx) = broadcast::channel::<RoomEvent>(256);
 
-    // Create channel for direct messages to this peer
-    let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    // Create channel for direct messages to this peer. Bounded so a stalled
+    // writer (slow / non-reading peer) can't grow the queue without bound.
+    let (direct_tx, mut direct_rx) = mpsc::channel::<ServerMessage>(DIRECT_CHANNEL_CAPACITY);
 
     // Register peer
     let registered = state.rooms.register_peer(room_tx);
@@ -110,9 +130,13 @@ pub async fn handle_socket(socket: WebSocket, state: AppState) {
         tokio::select! {
             biased;
             _ = kick.notified() => {
-                let _ = direct_tx_in.send(ServerMessage::Kicked {
-                    reason: "idle timeout".to_string(),
-                });
+                try_send_direct(
+                    &direct_tx_in,
+                    &peer_id_in,
+                    ServerMessage::Kicked {
+                        reason: "idle timeout".to_string(),
+                    },
+                );
                 // Brief pause so the writer task can flush the Kicked frame
                 // before we drop the socket.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -254,7 +278,7 @@ async fn handle_client_message(
     peer_id: &str,
     msg: ClientMessage,
     state: &AppState,
-    direct_tx: &mpsc::UnboundedSender<ServerMessage>,
+    direct_tx: &mpsc::Sender<ServerMessage>,
 ) {
     match msg {
         ClientMessage::JoinRoom {
@@ -279,9 +303,13 @@ async fn handle_client_message(
             // Always tell the client the validation outcome, so its UI can
             // leave the "Validating..." state deterministically even when
             // they didn't provide a key (in which case account_name is None).
-            let _ = direct_tx.send(ServerMessage::AccountValidated {
-                account_name: validated.as_ref().map(|(name, _)| name.clone()),
-            });
+            try_send_direct(
+                direct_tx,
+                peer_id,
+                ServerMessage::AccountValidated {
+                    account_name: validated.as_ref().map(|(name, _)| name.clone()),
+                },
+            );
 
             let Some((account_name, api_world_id)) = validated else {
                 let reason = if api_key
@@ -299,10 +327,14 @@ async fn handle_client_message(
                     room_id,
                     reason
                 );
-                let _ = direct_tx.send(ServerMessage::JoinRejected {
-                    room_id: room_id.clone(),
-                    reason: reason.to_string(),
-                });
+                try_send_direct(
+                    direct_tx,
+                    peer_id,
+                    ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: reason.to_string(),
+                    },
+                );
                 return;
             };
 
@@ -316,10 +348,14 @@ async fn handle_client_message(
                     room_id,
                     account_name
                 );
-                let _ = direct_tx.send(ServerMessage::JoinRejected {
-                    room_id: room_id.clone(),
-                    reason: "account has too many active connections".to_string(),
-                });
+                try_send_direct(
+                    direct_tx,
+                    peer_id,
+                    ServerMessage::JoinRejected {
+                        room_id: room_id.clone(),
+                        reason: "account has too many active connections".to_string(),
+                    },
+                );
                 return;
             }
 
@@ -330,17 +366,25 @@ async fn handle_client_message(
             // so only peers inside the same match can know the correct key.
             if let Some(rest) = room_id.strip_prefix("pvp-team:") {
                 let Some((_match_key, claimed_color)) = parse_pvp_room_rest(rest) else {
-                    let _ = direct_tx.send(ServerMessage::JoinRejected {
-                        room_id: room_id.clone(),
-                        reason: "malformed pvp-team room id".to_string(),
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::JoinRejected {
+                            room_id: room_id.clone(),
+                            reason: "malformed pvp-team room id".to_string(),
+                        },
+                    );
                     return;
                 };
                 if !is_pvp_team_color(claimed_color) {
-                    let _ = direct_tx.send(ServerMessage::JoinRejected {
-                        room_id: room_id.clone(),
-                        reason: "unrecognized PvP team color".to_string(),
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::JoinRejected {
+                            room_id: room_id.clone(),
+                            reason: "unrecognized PvP team color".to_string(),
+                        },
+                    );
                     return;
                 }
             }
@@ -349,10 +393,14 @@ async fn handle_client_message(
             // color match what the GW2 API actually says about this account.
             if let Some(rest) = room_id.strip_prefix("wvw-team:") {
                 let Some((claimed_world, claimed_color)) = parse_wvw_room_rest(rest) else {
-                    let _ = direct_tx.send(ServerMessage::JoinRejected {
-                        room_id: room_id.clone(),
-                        reason: "malformed wvw-team room id".to_string(),
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::JoinRejected {
+                            room_id: room_id.clone(),
+                            reason: "malformed wvw-team room id".to_string(),
+                        },
+                    );
                     return;
                 };
 
@@ -364,18 +412,26 @@ async fn handle_client_message(
                         claimed_world,
                         api_world_id
                     );
-                    let _ = direct_tx.send(ServerMessage::JoinRejected {
-                        room_id: room_id.clone(),
-                        reason: "world does not match your GW2 account".to_string(),
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::JoinRejected {
+                            room_id: room_id.clone(),
+                            reason: "world does not match your GW2 account".to_string(),
+                        },
+                    );
                     return;
                 }
 
                 let Some(claimed_team) = wvw::WvwTeam::from_color_id(claimed_color) else {
-                    let _ = direct_tx.send(ServerMessage::JoinRejected {
-                        room_id: room_id.clone(),
-                        reason: "unrecognized WvW team color".to_string(),
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::JoinRejected {
+                            room_id: room_id.clone(),
+                            reason: "unrecognized WvW team color".to_string(),
+                        },
+                    );
                     return;
                 };
 
@@ -389,10 +445,14 @@ async fn handle_client_message(
                         room_id,
                         reason
                     );
-                    let _ = direct_tx.send(ServerMessage::JoinRejected {
-                        room_id: room_id.clone(),
-                        reason,
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::JoinRejected {
+                            room_id: room_id.clone(),
+                            reason,
+                        },
+                    );
                     return;
                 }
             }
@@ -402,7 +462,7 @@ async fn handle_client_message(
                     room_id: room_id.clone(),
                     peers: peers.into_iter().map(Into::into).collect(),
                 };
-                let send_ok = direct_tx.send(response).is_ok();
+                let send_ok = direct_tx.try_send(response).is_ok();
                 tracing::info!("Sent RoomJoined to {} (ok={})", peer_id, send_ok);
             } else {
                 tracing::warn!("join_room returned None for peer {}", peer_id);
@@ -422,7 +482,11 @@ async fn handle_client_message(
                 .try_set_account_name(peer_id, account_name.clone())
             {
                 Ok(()) => {
-                    let _ = direct_tx.send(ServerMessage::AccountValidated { account_name });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::AccountValidated { account_name },
+                    );
                 }
                 Err(AccountCapExceeded) => {
                     // The key validated, but the account already has too many
@@ -435,10 +499,18 @@ async fn handle_client_message(
                             name
                         );
                     }
-                    let _ = direct_tx.send(ServerMessage::AccountValidated { account_name: None });
-                    let _ = direct_tx.send(ServerMessage::Error {
-                        message: "account has too many active connections".to_string(),
-                    });
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::AccountValidated { account_name: None },
+                    );
+                    try_send_direct(
+                        direct_tx,
+                        peer_id,
+                        ServerMessage::Error {
+                            message: "account has too many active connections".to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -494,11 +566,15 @@ async fn handle_client_message(
             }
             let cluster_id = state.squads.identify(deduped);
             tracing::info!("IdentifyGroup from {}: cluster={}", peer_id, cluster_id);
-            let _ = direct_tx.send(ServerMessage::GroupIdentified { cluster_id });
+            try_send_direct(
+                direct_tx,
+                peer_id,
+                ServerMessage::GroupIdentified { cluster_id },
+            );
         }
 
         ClientMessage::Ping => {
-            let _ = direct_tx.send(ServerMessage::Pong);
+            try_send_direct(direct_tx, peer_id, ServerMessage::Pong);
         }
     }
 }

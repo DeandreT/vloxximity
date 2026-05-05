@@ -152,3 +152,19 @@ fn pvp_team_color_rejects_unknown_colors() {
     assert!(!is_pvp_team_color(23));
     assert!(!is_pvp_team_color(1));
 }
+
+#[test]
+fn try_send_direct_drops_when_full() {
+    // Pin the non-blocking semantics of try_send_direct: when the channel
+    // is saturated, the call must drop the message rather than block or
+    // panic. Guards against a future refactor reintroducing `.send().await`,
+    // which would let a stalled writer stall the inbound dispatch loop.
+    let (tx, _rx) = mpsc::channel::<ServerMessage>(2);
+    tx.try_send(ServerMessage::Pong).unwrap();
+    tx.try_send(ServerMessage::Pong).unwrap();
+    try_send_direct(&tx, "peer", ServerMessage::Pong);
+    assert!(matches!(
+        tx.try_send(ServerMessage::Pong),
+        Err(mpsc::error::TrySendError::Full(_))
+    ));
+}
