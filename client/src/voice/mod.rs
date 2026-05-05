@@ -1,4 +1,5 @@
 pub mod active_speak;
+pub mod auto_rooms;
 pub mod group;
 pub mod manager;
 pub mod mixer;

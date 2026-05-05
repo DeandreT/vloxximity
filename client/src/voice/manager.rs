@@ -10,11 +10,11 @@ use tokio::sync::mpsc;
 
 use crate::audio::thread::AudioCommand;
 use crate::audio::{AudioThread, IncomingAudioCommand, OpusEncoder, VoiceActivityDetector};
-use crate::position::mumble_link::{is_pvp_map_type, MAP_TYPE_WVW_MAX, MAP_TYPE_WVW_MIN};
 use crate::position::MumbleLink;
 use nexus::rtapi::RealTimeApi;
 
 use super::active_speak::ActiveSpeak;
+use super::auto_rooms;
 use super::group::{GroupKind, GroupMemberEvent, GroupState};
 use super::network::{network_task, NetworkCommand, NetworkEvent};
 use super::peer::VoicePeer;
@@ -301,11 +301,7 @@ impl VoiceManager {
             // can route it without knowing about room types. Only the map
             // room is auto-managed here; other rooms (squad/party/etc.) are
             // joined via the UI and persist across map changes.
-            let map_room_id = if state.is_in_game() {
-                Some(format!("map:{}", state.room_key))
-            } else {
-                None
-            };
+            let map_room_id = auto_rooms::map_room_for(&state);
 
             if self.current_map_room != map_room_id {
                 // Leave the old map room (if any) without touching other rooms.
@@ -315,19 +311,7 @@ impl VoiceManager {
 
                 // Join the new map room if we're in game.
                 if let Some(new_room) = map_room_id.as_deref() {
-                    let player_name = state
-                        .identity
-                        .as_ref()
-                        .and_then(|i| {
-                            let n = i.name.trim();
-                            if n.is_empty() {
-                                None
-                            } else {
-                                Some(i.name.clone())
-                            }
-                        })
-                        .unwrap_or_else(|| "Unknown".to_string());
-
+                    let player_name = auto_rooms::player_name_from(&state);
                     self.join_room(new_room, &player_name)?;
                 }
             }
@@ -335,38 +319,16 @@ impl VoiceManager {
             // Auto-manage the WvW team room. Derived from world_id and
             // team_color_id so all players on the same team share one room
             // regardless of which WvW map they're on. Only set while the
-            // map_type falls in the WvW range (10–18) so PvP team colors
-            // don't accidentally route players into a WvW team room.
-            let wvw_team_room_id = if state.is_in_game() && self.settings.auto_join_wvw_rooms {
-                state
-                    .identity
-                    .as_ref()
-                    .filter(|id| {
-                        id.team_color_id != 0
-                            && (MAP_TYPE_WVW_MIN..=MAP_TYPE_WVW_MAX).contains(&state.map_type)
-                    })
-                    .map(|id| format!("wvw-team:{}-{}", id.world_id, id.team_color_id))
-            } else {
-                None
-            };
+            // map_type falls in the WvW range so PvP team colors don't
+            // accidentally route players into a WvW team room.
+            let wvw_team_room_id = auto_rooms::wvw_team_room_for(&state, &self.settings);
 
             if self.current_wvw_team_room != wvw_team_room_id {
                 if let Some(old) = self.current_wvw_team_room.take() {
                     self.leave_room(&old);
                 }
                 if let Some(new_room) = wvw_team_room_id.as_deref() {
-                    let player_name = state
-                        .identity
-                        .as_ref()
-                        .and_then(|i| {
-                            let n = i.name.trim();
-                            if n.is_empty() {
-                                None
-                            } else {
-                                Some(i.name.clone())
-                            }
-                        })
-                        .unwrap_or_else(|| "Unknown".to_string());
+                    let player_name = auto_rooms::player_name_from(&state);
                     self.join_room(new_room, &player_name)?;
                 }
                 self.current_wvw_team_room = wvw_team_room_id;
@@ -376,38 +338,14 @@ impl VoiceManager {
             // (pvp_match_key) + team so only teammates in the same match
             // share a room. Leaves automatically when the player exits the
             // arena (pvp_match_key becomes None).
-            let pvp_team_room_id =
-                if state.is_in_game() && self.settings.auto_join_pvp_rooms {
-                    state
-                        .identity
-                        .as_ref()
-                        .filter(|id| id.team_color_id != 0 && is_pvp_map_type(state.map_type))
-                        .and_then(|id| {
-                            state.pvp_match_key.as_ref().map(|key| {
-                                format!("pvp-team:{}-{}", key, id.team_color_id)
-                            })
-                        })
-                } else {
-                    None
-                };
+            let pvp_team_room_id = auto_rooms::pvp_team_room_for(&state, &self.settings);
 
             if self.current_pvp_team_room != pvp_team_room_id {
                 if let Some(old) = self.current_pvp_team_room.take() {
                     self.leave_room(&old);
                 }
                 if let Some(new_room) = pvp_team_room_id.as_deref() {
-                    let player_name = state
-                        .identity
-                        .as_ref()
-                        .and_then(|i| {
-                            let n = i.name.trim();
-                            if n.is_empty() {
-                                None
-                            } else {
-                                Some(i.name.clone())
-                            }
-                        })
-                        .unwrap_or_else(|| "Unknown".to_string());
+                    let player_name = auto_rooms::player_name_from(&state);
                     self.join_room(new_room, &player_name)?;
                 }
                 self.current_pvp_team_room = pvp_team_room_id;
