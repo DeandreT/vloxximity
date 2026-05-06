@@ -48,6 +48,7 @@ pub struct VoiceSettings {
     pub input_volume: f32,
     pub output_volume: f32,
     /// Session-only
+    #[serde(skip)]
     pub is_muted: bool,
     /// Session-only
     #[serde(skip)]

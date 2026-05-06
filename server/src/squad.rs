@@ -68,7 +68,7 @@ impl SquadRegistry {
             if overlap < MIN_OVERLAP {
                 continue;
             }
-            if best.as_ref().map_or(true, |(_, o)| overlap > *o) {
+            if best.as_ref().is_none_or(|(_, o)| overlap > *o) {
                 best = Some((cluster.id.clone(), overlap));
             }
         }

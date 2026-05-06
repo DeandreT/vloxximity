@@ -35,7 +35,7 @@ impl log::Log for NexusLogger {
         }
 
         // Send to Nexus logging system. Ignore any errors.
-        let _ = nexus_log(level, target, msg);
+        nexus_log(level, target, msg);
     }
 
     fn flush(&self) {}

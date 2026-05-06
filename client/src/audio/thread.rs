@@ -305,6 +305,7 @@ impl PlaybackPeer {
 impl PeerRoomStream {
     /// Pull a frame for this stream and render it to stereo. Returns
     /// false when there's nothing buffered yet (caller skips it).
+    #[allow(clippy::too_many_arguments)]
     fn next_spatial_audio(
         &mut self,
         peer_name: &str,

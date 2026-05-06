@@ -90,14 +90,14 @@ impl SignalingClient {
                     ClientOutboundMessage::Text(msg) => {
                         let json = serde_json::to_string(&msg).unwrap();
                         log::debug!("Signaling outgoing: {}", json);
-                        if write.send(Message::Text(json.into())).await.is_err() {
+                        if write.send(Message::Text(json)).await.is_err() {
                             log::warn!("Signaling write task: failed to send message");
                             break;
                         }
                     }
                     ClientOutboundMessage::Audio { room_id, data } => {
                         let frame = encode_client_audio_frame(&room_id, &data);
-                        if write.send(Message::Binary(frame.into())).await.is_err() {
+                        if write.send(Message::Binary(frame)).await.is_err() {
                             log::warn!("Signaling write task: failed to send audio");
                             break;
                         }

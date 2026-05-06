@@ -42,7 +42,10 @@ fn is_wine() -> bool {
     use std::os::raw::{c_char, c_void};
     use std::sync::OnceLock;
 
+    // Match Win32 header naming so call sites read like the C API.
+    #[allow(clippy::upper_case_acronyms)]
     type HMODULE = *mut c_void;
+    #[allow(clippy::upper_case_acronyms)]
     type FARPROC = *const c_void;
 
     extern "system" {
@@ -267,21 +270,23 @@ mod tests {
 
     #[test]
     fn settings_roundtrip_preserves_persistent_fields() {
-        let mut original = VoiceSettings::default();
-        original.mode = VoiceMode::VoiceActivity;
-        original.ptt_key = 0x42;
-        original.min_distance = 250.0;
-        original.max_distance = 7500.0;
-        original.input_volume = 0.8;
-        original.output_volume = 0.6;
-        original.directional_audio_enabled = false;
-        original.spatial_3d_enabled = false;
-        original.show_peer_markers = true;
-        original.server_url = "wss://example.com/ws".to_string();
-        original.gw2_api_key = "secret-key".to_string();
-        // Session-only — should NOT survive the round trip.
-        original.is_muted = true;
-        original.is_deafened = true;
+        let original = VoiceSettings {
+            mode: VoiceMode::VoiceActivity,
+            ptt_key: 0x42,
+            min_distance: 250.0,
+            max_distance: 7500.0,
+            input_volume: 0.8,
+            output_volume: 0.6,
+            directional_audio_enabled: false,
+            spatial_3d_enabled: false,
+            show_peer_markers: true,
+            server_url: "wss://example.com/ws".to_string(),
+            gw2_api_key: "secret-key".to_string(),
+            // Session-only — should NOT survive the round trip.
+            is_muted: true,
+            is_deafened: true,
+            ..VoiceSettings::default()
+        };
 
         let restored = roundtrip_settings(&original);
         assert_eq!(restored.mode, VoiceMode::VoiceActivity);
@@ -304,8 +309,10 @@ mod tests {
 
     #[test]
     fn serialized_settings_never_contain_api_key() {
-        let mut s = VoiceSettings::default();
-        s.gw2_api_key = "DO-NOT-LEAK-THIS-1234".to_string();
+        let s = VoiceSettings {
+            gw2_api_key: "DO-NOT-LEAK-THIS-1234".to_string(),
+            ..VoiceSettings::default()
+        };
         let text = serde_json::to_string_pretty(&s).expect("serialize");
         assert!(
             !text.contains("DO-NOT-LEAK-THIS-1234"),

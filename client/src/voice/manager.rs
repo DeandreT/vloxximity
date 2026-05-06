@@ -21,9 +21,6 @@ use super::peer::VoicePeer;
 use super::persist;
 use super::room_type::RoomType;
 
-// Re-exported so existing callers using `crate::voice::manager::*` paths
-// (e.g. `ui/settings.rs`, `voice/persist/settings.rs`) keep working after
-// the type definitions moved to `super::types`.
 pub use super::types::{
     ApiKeyStatus, GroupSuggestions, NearbyPeer, SpeakingIndicatorSettings, VoiceMode,
     VoiceSettings, VoiceState, DEFAULT_SERVER_URL,
@@ -105,6 +102,11 @@ pub struct VoiceManager {
     // peer marker overlay.
     last_camera_transform: Option<crate::position::Transform>,
     last_fov: Option<f32>,
+
+    // Cached player name from the most recent MumbleLink read. Refreshed
+    // each `update()` tick so the auto-join paths (and tests) don't have
+    // to call into MumbleLink themselves.
+    last_player_name: String,
 
     // Our own GW2 account handle, read from RTAPI when available. Shown in
     // the settings UI so the user can sanity-check the API key they pasted.
@@ -193,6 +195,7 @@ impl VoiceManager {
             last_listener_position: None,
             last_camera_transform: None,
             last_fov: None,
+            last_player_name: "Unknown".to_string(),
             own_account_name: None,
             muted_accounts,
             api_key_status: Arc::new(PlRwLock::new(ApiKeyStatus::Unknown)),
@@ -294,6 +297,7 @@ impl VoiceManager {
             self.last_listener_position = Some(state.camera_transform.position);
             self.last_camera_transform = Some(state.camera_transform);
             self.last_fov = state.identity.as_ref().map(|i| i.fov).filter(|f| *f > 0.0);
+            self.last_player_name = auto_rooms::player_name_from(&state);
             self.send_incoming_audio_command(IncomingAudioCommand::SetListenerTransform(
                 state.camera_transform,
             ));
@@ -460,12 +464,7 @@ impl VoiceManager {
         }
 
         if let Some(new_room) = target {
-            let player_name = self
-                .mumble_link
-                .read()
-                .and_then(|s| s.identity.as_ref().map(|i| i.name.clone()))
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| "Unknown".to_string());
+            let player_name = self.last_player_name.clone();
             if let Err(e) = self.join_room(&new_room, &player_name) {
                 log::warn!("Auto-join of {} failed: {}", new_room, e);
                 return;
@@ -1133,7 +1132,7 @@ impl VoiceManager {
 
     /// Receive audio data for a peer in a specific room. The actual decode
     /// + playback happens on the audio thread (already dispatched by the
-    /// network task); this just refreshes the speaking-indicator timer.
+    ///   network task); this just refreshes the speaking-indicator timer.
     pub fn receive_peer_audio(
         &mut self,
         peer_id: &str,

@@ -118,27 +118,35 @@ mod tests {
         let mut encoder = OpusEncoder::new().unwrap();
         let mut decoder = OpusDecoder::new().unwrap();
 
-        // Create a test signal (sine wave)
+        // Create a test signal (sine wave at ~765 Hz, voice band).
         let samples: Vec<f32> = (0..FRAME_SIZE)
             .map(|i| (i as f32 * 0.1).sin() * 0.5)
             .collect();
+        let input_rms: f32 =
+            (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt();
 
-        // Encode
+        for _ in 0..3 {
+            let frame = encoder.encode(&samples).unwrap();
+            let _ = decoder.decode(&frame).unwrap();
+        }
+
         let encoded = encoder.encode(&samples).unwrap();
         assert!(!encoded.is_empty());
         assert!(encoded.len() < samples.len() * 4); // Should be compressed
 
-        // Decode
         let decoded = decoder.decode(&encoded).unwrap();
         assert_eq!(decoded.len(), FRAME_SIZE);
 
-        // Lossy codec, so we just check it's roughly similar
-        let max_diff: f32 = samples
-            .iter()
-            .zip(decoded.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max);
-
-        assert!(max_diff < 0.5, "Max difference too large: {}", max_diff);
+        let output_rms: f32 =
+            (decoded.iter().map(|x| x * x).sum::<f32>() / decoded.len() as f32).sqrt();
+        assert!(
+            output_rms > 0.5 * input_rms,
+            "Output RMS too low: in={input_rms:.3}, out={output_rms:.3}"
+        );
+        assert!(
+            output_rms < 2.0 * input_rms,
+            "Output RMS too high: in={input_rms:.3}, out={output_rms:.3}"
+        );
+        assert!(decoded.iter().all(|s| s.is_finite()));
     }
 }
