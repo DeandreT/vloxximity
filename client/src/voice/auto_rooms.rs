@@ -75,10 +75,11 @@ mod tests {
     };
 
     fn in_game_state() -> PlayerState {
-        let mut state = PlayerState::default();
-        state.ui_tick = 1;
-        state.room_key = "abc".to_string();
-        state
+        PlayerState {
+            ui_tick: 1,
+            room_key: "abc".to_string(),
+            ..PlayerState::default()
+        }
     }
 
     fn identity_with(team_color_id: u32, world_id: u32, name: &str) -> PlayerIdentity {
@@ -156,8 +157,10 @@ mod tests {
         let mut state = in_game_state();
         state.identity = Some(identity_with(9, 1001, "Alice"));
         state.map_type = MAP_TYPE_WVW_MIN;
-        let mut settings = VoiceSettings::default();
-        settings.auto_join_wvw_rooms = false;
+        let settings = VoiceSettings {
+            auto_join_wvw_rooms: false,
+            ..VoiceSettings::default()
+        };
         assert_eq!(wvw_team_room_for(&state, &settings), None);
     }
 
@@ -230,8 +233,10 @@ mod tests {
         state.identity = Some(identity_with(5, 1, "Alice"));
         state.map_type = MAP_TYPE_COMPETITIVE;
         state.pvp_match_key = Some("xyz".to_string());
-        let mut settings = VoiceSettings::default();
-        settings.auto_join_pvp_rooms = false;
+        let settings = VoiceSettings {
+            auto_join_pvp_rooms: false,
+            ..VoiceSettings::default()
+        };
         assert_eq!(pvp_team_room_for(&state, &settings), None);
     }
 

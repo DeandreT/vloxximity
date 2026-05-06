@@ -194,11 +194,11 @@ impl SettingsWindow {
 
                     if let Some(_combo) = ui.begin_combo("##input", input_preview) {
                         for (i, device) in self.input_devices.iter().enumerate() {
-                            if Selectable::new(device).build(ui) {
-                                if i != self.selected_input_device {
-                                    self.selected_input_device = i;
-                                    self.pending_input_device = Some(device.clone());
-                                }
+                            if Selectable::new(device).build(ui)
+                                && i != self.selected_input_device
+                            {
+                                self.selected_input_device = i;
+                                self.pending_input_device = Some(device.clone());
                             }
                         }
                     }
@@ -215,11 +215,11 @@ impl SettingsWindow {
 
                     if let Some(_combo) = ui.begin_combo("##output", output_preview) {
                         for (i, device) in self.output_devices.iter().enumerate() {
-                            if Selectable::new(device).build(ui) {
-                                if i != self.selected_output_device {
-                                    self.selected_output_device = i;
-                                    self.pending_output_device = Some(device.clone());
-                                }
+                            if Selectable::new(device).build(ui)
+                                && i != self.selected_output_device
+                            {
+                                self.selected_output_device = i;
+                                self.pending_output_device = Some(device.clone());
                             }
                         }
                     }
@@ -517,7 +517,7 @@ impl SettingsWindow {
                         ui.same_line();
                         if already_joined.contains(&suggestions.room_id) {
                             ui.text_disabled("joined");
-                        } else if ui.small_button(format!("Join##suggest_group")) {
+                        } else if ui.small_button("Join##suggest_group") {
                             self.pending_join_room = Some(suggestions.room_id.clone());
                             self.join_room_error = None;
                         }
@@ -608,10 +608,8 @@ impl SettingsWindow {
                                 if ui.small_button(format!("Unmute##{}", peer.peer_id)) {
                                     self.pending_mutes.push((peer.peer_id.clone(), false));
                                 }
-                            } else {
-                                if ui.small_button(format!("Mute##{}", peer.peer_id)) {
-                                    self.pending_mutes.push((peer.peer_id.clone(), true));
-                                }
+                            } else if ui.small_button(format!("Mute##{}", peer.peer_id)) {
+                                self.pending_mutes.push((peer.peer_id.clone(), true));
                             }
 
                             match peer.account_name.as_deref() {

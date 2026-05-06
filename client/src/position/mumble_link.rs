@@ -81,7 +81,7 @@ pub fn is_pvp_map_type(map_type: u32) -> bool {
 }
 
 /// Player state snapshot
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct PlayerState {
     pub transform: Transform,
     pub camera_transform: Transform,
@@ -95,21 +95,6 @@ pub struct PlayerState {
     /// a hash of (server_address + map_id + instance) so it is unique per
     /// match but stable across the duration of the same match.
     pub pvp_match_key: Option<String>,
-}
-
-impl Default for PlayerState {
-    fn default() -> Self {
-        Self {
-            transform: Transform::default(),
-            camera_transform: Transform::default(),
-            identity: None,
-            room_key: String::new(),
-            map_id: 0,
-            map_type: 0,
-            ui_tick: 0,
-            pvp_match_key: None,
-        }
-    }
 }
 
 impl PlayerState {
@@ -320,7 +305,7 @@ fn parse_identity(identity: &[u16; 256]) -> Option<PlayerIdentity> {
 /// shard_id so the key is stable across the duration of a single match.
 fn generate_pvp_match_key(context: &MumbleContext) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(&context.server_address);
+    hasher.update(context.server_address);
     hasher.update(context.map_id.to_le_bytes());
     hasher.update(context.instance.to_le_bytes());
     let result = hasher.finalize();
@@ -332,7 +317,7 @@ fn generate_room_key(context: &MumbleContext) -> String {
     let mut hasher = Sha256::new();
 
     // Hash server address (identifies the map server)
-    hasher.update(&context.server_address);
+    hasher.update(context.server_address);
 
     // Hash map ID
     hasher.update(context.map_id.to_le_bytes());

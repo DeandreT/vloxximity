@@ -4,8 +4,8 @@
 //! - `Off`    — centered mono; only distance attenuation.
 //! - `Pan2D`  — legacy equal-power horizontal pan from azimuth.
 //! - `Full3D` — ITD (per-ear delay) + front/back one-pole LPF + equal-power
-//!              pan from the full 3D direction, with per-frame parameter
-//!              ramping to avoid zipper noise.
+//!   pan from the full 3D direction, with per-frame parameter ramping to
+//!   avoid zipper noise.
 
 use crate::position::{Position, Transform};
 
@@ -24,17 +24,12 @@ const DELAY_MASK: usize = DELAY_BUF_LEN - 1;
 /// matches the legacy 2D panner so mode A/B loudness stays consistent.
 const CENTER_COMPENSATION: f32 = std::f32::consts::SQRT_2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SpatialMode {
     Off,
     Pan2D,
+    #[default]
     Full3D,
-}
-
-impl Default for SpatialMode {
-    fn default() -> Self {
-        SpatialMode::Full3D
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
