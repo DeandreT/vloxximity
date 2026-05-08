@@ -127,6 +127,12 @@ fn addon_load() {
             let party_handler = keybind_handler!(handle_ptt_per_type);
             register_keybind_with_string("Push To Talk (Party)", party_handler, "")
                 .revert_on_unload();
+            let wvw_handler = keybind_handler!(handle_ptt_per_type);
+            register_keybind_with_string("Push To Talk (WvW Team)", wvw_handler, "")
+                .revert_on_unload();
+            let pvp_handler = keybind_handler!(handle_ptt_per_type);
+            register_keybind_with_string("Push To Talk (PvP Team)", pvp_handler, "")
+                .revert_on_unload();
 
             let toggle_handler = keybind_handler!(handle_toggle);
             register_keybind_with_string("Settings Window Toggle", toggle_handler, "")
@@ -325,6 +331,8 @@ fn handle_ptt_per_type(identifier: &str, is_release: bool) {
         "Push To Talk (Map)" => Some(RoomType::Map),
         "Push To Talk (Squad)" => Some(RoomType::Squad),
         "Push To Talk (Party)" => Some(RoomType::Party),
+        "Push To Talk (WvW Team)" => Some(RoomType::WvwTeam),
+        "Push To Talk (PvP Team)" => Some(RoomType::PvpTeam),
         _ => None,
     }) else {
         return;
