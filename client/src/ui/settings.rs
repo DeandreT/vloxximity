@@ -251,7 +251,13 @@ impl SettingsWindow {
 
                     ui.spacing();
                     ui.text_disabled("Per-room-type volumes (multiplied with output)");
-                    let types = [RoomType::Map, RoomType::Squad, RoomType::Party];
+                    let types = [
+                        RoomType::Map,
+                        RoomType::Squad,
+                        RoomType::Party,
+                        RoomType::WvwTeam,
+                        RoomType::PvpTeam,
+                    ];
                     for ty in types {
                         let mut v = new_settings.room_type_volumes.get(ty);
                         let label = format!("{}##room_vol", ty.label());
@@ -481,12 +487,20 @@ impl SettingsWindow {
 
                 ui.separator();
 
-                // Auto-join toggle. Off by user choice → group rooms behave
-                // like manual rooms (only the suggestion's Join button adds
-                // them).
+                // Auto-join toggles.
                 let mut auto_join_group = new_settings.auto_join_group_rooms;
                 if ui.checkbox("Auto-join squad/party rooms", &mut auto_join_group) {
                     new_settings.auto_join_group_rooms = auto_join_group;
+                    settings_changed = true;
+                }
+                let mut auto_join_wvw = new_settings.auto_join_wvw_rooms;
+                if ui.checkbox("Auto-join WvW team room", &mut auto_join_wvw) {
+                    new_settings.auto_join_wvw_rooms = auto_join_wvw;
+                    settings_changed = true;
+                }
+                let mut auto_join_pvp = new_settings.auto_join_pvp_rooms;
+                if ui.checkbox("Auto-join PvP team room", &mut auto_join_pvp) {
+                    new_settings.auto_join_pvp_rooms = auto_join_pvp;
                     settings_changed = true;
                 }
 
@@ -561,8 +575,10 @@ impl SettingsWindow {
                         if id.is_empty() {
                             self.join_room_error = Some("Enter a room id first".to_string());
                         } else if RoomType::from_room_id(&id).is_none() {
-                            self.join_room_error =
-                                Some("Room id must start with map:, squad:, or party:".to_string());
+                            self.join_room_error = Some(
+                                "Room id must start with map:, squad:, party:, wvw-team:, or pvp-team:"
+                                    .to_string(),
+                            );
                         } else {
                             self.pending_join_room = Some(id);
                             self.join_room_buffer.clear();
@@ -667,6 +683,8 @@ impl SettingsWindow {
                 s.gw2_api_key = settings.gw2_api_key;
                 s.room_type_volumes = settings.room_type_volumes;
                 s.auto_join_group_rooms = settings.auto_join_group_rooms;
+                s.auto_join_wvw_rooms = settings.auto_join_wvw_rooms;
+                s.auto_join_pvp_rooms = settings.auto_join_pvp_rooms;
                 s.speaking_indicator = settings.speaking_indicator;
             });
             crate::voice::persist::save_settings(&voice_manager.settings());
