@@ -2,6 +2,7 @@
 
 use crate::voice::manager::ApiKeyStatus;
 use crate::voice::room_type::RoomType;
+use crate::voice::types::VadSensitivity;
 use crate::voice::{VoiceManager, VoiceMode, VoiceSettings};
 use nexus::imgui::{Condition, InputTextFlags, Selectable, Slider, TreeNodeFlags, Ui, Window};
 
@@ -157,6 +158,26 @@ impl SettingsWindow {
                     if ui.radio_button("Voice Activity", &mut mode_idx, 1) {
                         new_settings.mode = VoiceMode::VoiceActivity;
                         settings_changed = true;
+                    }
+                    if new_settings.mode == VoiceMode::VoiceActivity {
+                        ui.indent();
+                        let sensitivities = [
+                            VadSensitivity::Normal,
+                            VadSensitivity::Aggressive,
+                            VadSensitivity::VeryAggressive,
+                        ];
+                        let preview = new_settings.vad_sensitivity.label();
+                        if let Some(_combo) = ui.begin_combo("Sensitivity##vad", preview) {
+                            for s in sensitivities {
+                                let selected = new_settings.vad_sensitivity == s;
+                                if Selectable::new(s.label()).selected(selected).build(ui) {
+                                    new_settings.vad_sensitivity = s;
+                                    settings_changed = true;
+                                }
+                            }
+                        }
+                        ui.text_disabled("Higher = less sensitive, better noise rejection");
+                        ui.unindent();
                     }
                     if ui.radio_button("Always On", &mut mode_idx, 2) {
                         new_settings.mode = VoiceMode::AlwaysOn;
@@ -671,6 +692,7 @@ impl SettingsWindow {
             let new_api_key = settings.gw2_api_key.clone();
             voice_manager.update_settings(|s| {
                 s.mode = settings.mode;
+                s.vad_sensitivity = settings.vad_sensitivity;
                 s.input_volume = settings.input_volume;
                 s.output_volume = settings.output_volume;
                 s.min_distance = settings.min_distance;
