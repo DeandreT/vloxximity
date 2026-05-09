@@ -22,6 +22,31 @@ pub enum ApiKeyStatus {
     Invalid { message: String },
 }
 
+/// How aggressively the WebRTC VAD filters background noise.
+///
+/// Higher aggressiveness = more noise rejection = harder to trigger.
+/// Maps directly onto `webrtc_vad::VadMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VadSensitivity {
+    /// Balanced — triggers on moderately quiet speech. Good default.
+    #[default]
+    Normal,
+    /// Stricter — ignores light background noise, requires clearer speech.
+    Aggressive,
+    /// Strictest — only clear speech triggers; best for noisy environments.
+    VeryAggressive,
+}
+
+impl VadSensitivity {
+    pub fn label(self) -> &'static str {
+        match self {
+            VadSensitivity::Normal => "Normal",
+            VadSensitivity::Aggressive => "Aggressive",
+            VadSensitivity::VeryAggressive => "Very Aggressive",
+        }
+    }
+}
+
 /// Voice activation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoiceMode {
@@ -42,6 +67,9 @@ pub const DEFAULT_SERVER_URL: &str = "ws://localhost:8080/ws";
 #[serde(default)]
 pub struct VoiceSettings {
     pub mode: VoiceMode,
+    /// Aggressiveness of the WebRTC VAD when `mode == VoiceActivity`.
+    #[serde(default)]
+    pub vad_sensitivity: VadSensitivity,
     pub ptt_key: u32,
     pub min_distance: f32,
     pub max_distance: f32,
@@ -132,6 +160,7 @@ impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             mode: VoiceMode::PushToTalk,
+            vad_sensitivity: VadSensitivity::Normal,
             ptt_key: 0,
             min_distance: 100.0,
             max_distance: 5000.0,

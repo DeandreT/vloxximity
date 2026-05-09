@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::thread::AudioCommand;
 use crate::audio::{AudioThread, IncomingAudioCommand, OpusEncoder, VoiceActivityDetector};
+use webrtc_vad::VadMode;
 use crate::position::MumbleLink;
 use nexus::rtapi::RealTimeApi;
 
@@ -230,6 +231,7 @@ impl VoiceManager {
         // Initialize VAD
         let vad = VoiceActivityDetector::new()?;
         self.vad = Some(vad);
+        self.sync_vad_settings();
 
         // Create tokio runtime for async networking
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1185,6 +1187,7 @@ impl VoiceManager {
     {
         f(&mut self.settings);
         self.sync_playback_settings();
+        self.sync_vad_settings();
     }
 
     /// Get current state
@@ -1338,6 +1341,17 @@ impl VoiceManager {
             if let Err(e) = audio_thread.send_incoming_command(cmd) {
                 log::trace!("Failed to send incoming audio command: {}", e);
             }
+        }
+    }
+
+    fn sync_vad_settings(&mut self) {
+        if let Some(ref mut vad) = self.vad {
+            let mode = match self.settings.vad_sensitivity {
+                super::types::VadSensitivity::Normal => VadMode::Quality,
+                super::types::VadSensitivity::Aggressive => VadMode::Aggressive,
+                super::types::VadSensitivity::VeryAggressive => VadMode::VeryAggressive,
+            };
+            let _ = vad.set_mode(mode);
         }
     }
 
